@@ -1,0 +1,13 @@
+{
+  "typeCheckingMode": "strict",
+  "include": [
+    "src",
+    "tests"
+  ],
+  "exclude": [
+    ".venv",
+    "data",
+    "artifacts",
+    "models"
+  ]
+}

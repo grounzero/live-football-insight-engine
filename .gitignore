@@ -1,0 +1,40 @@
+# Raw and processed match data is never committed.
+# Metrica sample data carries no formal licence (see docs/data_card.md) and is
+# ~180 MB; `make data` downloads it into data/ at setup time.
+data/
+!data/.gitkeep
+
+# Generated artifacts: models, reports, benchmarks, experiment tracking.
+artifacts/
+!artifacts/.gitkeep
+mlruns/
+*.onnx
+*.pt
+*.pkl
+*.joblib
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+build/
+dist/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+
+# Node / demo
+node_modules/
+demo/dist/
+demo/.vite/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.swp

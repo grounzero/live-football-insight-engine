@@ -1,0 +1,20 @@
+# Local single-service setup. Deliberately not a microservice fan-out: nothing
+# here would demonstrate a capability that one container does not.
+#
+# The dataset is mounted rather than baked in — it carries no redistribution
+# licence, so it must not end up in an image layer.
+
+services:
+  insight-engine:
+    build: .
+    image: football-insights:local
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data:ro
+      - ./artifacts:/app/artifacts:ro
+    environment:
+      FI_SERVICE__LOG_LEVEL: INFO
+      FI_REPLAY__SPEED: "8"
+    command: ["serve", "--match", "Sample_Game_2", "--speed", "8"]
+    restart: unless-stopped

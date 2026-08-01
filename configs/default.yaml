@@ -1,0 +1,54 @@
+# Resolved configuration for the reference run.
+# Every value here can also be set with an FI_-prefixed environment variable,
+# e.g. FI_WINDOW__HORIZON_S=7. See src/football_insights/config.py.
+
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  registry_dir: artifacts/registry
+  reports_dir: artifacts/reports
+  mlflow_uri: "file:./artifacts/mlruns"
+
+window:
+  observation_s: 5.0      # history the model sees
+  horizon_s: 5.0          # how far ahead the target looks
+  stride_s: 0.5           # sampling interval
+  sample_hz: 10.0         # 5 s at 10 Hz gives 50 timesteps
+  min_valid_frame_ratio: 0.8
+
+episode:
+  merge_gap_s: 10.0            # entries this close merge into one episode
+  alarm_bridge_gap_s: 2.0      # bridges probability flicker across the threshold
+  max_false_alarms_per_90: 12.0
+  bootstrap_replicates: 2000
+  bootstrap_seed: 20260801
+  confidence_level: 0.95
+
+model:
+  predictor: gru
+  backend: torch
+  seed: 20260801
+  hidden_size: 48
+  num_layers: 1
+  dropout: 0.2
+  learning_rate: 0.001
+  batch_size: 256
+  max_epochs: 60
+  early_stopping_patience: 8
+
+editorial:
+  cooldown_s: 20.0
+  max_staleness_s: 2.0
+  duplicate_window_s: 45.0
+  min_consecutive_windows: 2
+  suppress_when_in_box: true
+
+replay:
+  speed: 8.0
+  fault_profile: clean
+  seed: 42
+
+service:
+  host: 127.0.0.1
+  port: 8000
+  log_level: INFO

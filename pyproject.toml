@@ -1,0 +1,150 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "football-insights"
+version = "0.1.0"
+description = "Live football insight engine: tracking data to qualified, viewer-facing insights"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+authors = [{ name = "Michael Grounds" }]
+keywords = ["football", "soccer", "tracking-data", "machine-learning", "real-time"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+# Constrained rather than hard-pinned: the reference run's exact versions are
+# recorded in requirements.lock.txt (see docs/reproducibility.md).
+dependencies = [
+    "numpy>=2.1,<3",
+    "pandas>=2.2,<4",
+    "scikit-learn>=1.5,<2",
+    "torch>=2.4,<3",
+    "onnx>=1.17,<2",
+    "onnxruntime>=1.19,<2",
+    "onnxscript>=0.1",
+    "fastapi>=0.115,<1",
+    "uvicorn[standard]>=0.30,<1",
+    "pydantic>=2.9,<3",
+    "pydantic-settings>=2.5,<3",
+    "sse-starlette>=2.1,<4",
+    "prometheus-client>=0.21,<1",
+    "typer>=0.12,<1",
+    "pyyaml>=6.0,<7",
+    "httpx>=0.27,<1",
+]
+
+[project.optional-dependencies]
+tracking = ["mlflow>=2.16,<4"]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-cov>=5.0",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.7",
+    "mypy>=1.11",
+    "types-pyyaml",
+    "pandas-stubs",
+    "pip-audit>=2.7",
+]
+
+[project.scripts]
+football-insights = "football_insights.cli:app"
+
+[project.urls]
+Homepage = "https://github.com/mgrounds/football-insights"
+Issues = "https://github.com/mgrounds/football-insights/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+football_insights = ["py.typed"]
+
+# ---------------------------------------------------------------- ruff
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = [
+    "E", "W",    # pycodestyle
+    "F",         # pyflakes
+    "I",         # isort
+    "N",         # pep8-naming
+    "UP",        # pyupgrade
+    "B",         # bugbear
+    "C4",        # comprehensions
+    "SIM",       # simplify
+    "RUF",       # ruff-specific
+    "ANN",       # annotations
+    "D",         # docstrings
+    "PTH",       # use pathlib
+    "RET",       # returns
+    "ARG",       # unused arguments
+]
+ignore = [
+    "D203",   # conflicts with D211
+    "D213",   # conflicts with D212
+    "ANN401", # allow Any where genuinely needed
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Pytest fixtures are requested by parameter name and are frequently unused in
+# the body (they exist for their side effects or to force ordering), so ARG002
+# and RUF059 are noise here rather than signal.
+"tests/**" = [
+    "D100", "D101", "D102", "D103", "D104",
+    "ANN201", "ANN001",
+    "ARG001", "ARG002", "RUF059",
+    "S101",
+]
+"scripts/**" = ["D100", "D103", "ANN201"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+# ---------------------------------------------------------------- mypy
+[tool.mypy]
+# 3.12, not 3.11: numpy's bundled stubs use PEP 695 `type` statements, which
+# mypy will not parse when told to target 3.11. The package still runs on 3.11
+# (see requires-python) — this only sets the syntax level for type checking.
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+disallow_any_generics = true
+show_error_codes = true
+files = ["src", "tests"]
+
+[[tool.mypy.overrides]]
+module = ["sklearn.*", "onnxruntime.*", "onnx.*", "mlflow.*", "sse_starlette.*", "joblib.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+
+# ---------------------------------------------------------------- pytest
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-q --strict-markers --strict-config"
+markers = [
+    "slow: takes more than a couple of seconds",
+    "requires_data: needs the downloaded Metrica dataset (skipped by default in CI)",
+]
+filterwarnings = ["error::DeprecationWarning:football_insights.*"]
+
+[tool.coverage.run]
+source = ["src/football_insights"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "raise NotImplementedError"]

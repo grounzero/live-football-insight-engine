@@ -1,0 +1,14 @@
+.venv/
+data/
+artifacts/
+mlruns/
+node_modules/
+demo/node_modules/
+.git/
+.github/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+tests/

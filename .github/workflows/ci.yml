@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# CI never downloads the Metrica dataset and never trains the reference model.
+# Every test runs against a seeded synthetic match generated in-process, which
+# keeps the pipeline fast and avoids depending on a third-party host that
+# publishes the data under no formal licence.
+env:
+  PYTHONUNBUFFERED: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+
+jobs:
+  quality:
+    name: Lint, types and tests (py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Format check
+        run: ruff format --check src tests
+
+      - name: Type check
+        run: mypy
+
+      - name: Tests
+        run: pytest -q -m "not requires_data" --cov --cov-report=term-missing
+
+  smoke:
+    name: Inference and ONNX parity smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
+
+      - name: Train a tiny model on synthetic data and check ONNX parity
+        # Deliberately not the reference model: this proves the export and
+        # runtime paths work, not that a two-epoch model is any good.
+        run: |
+          python - <<'PY'
+          import numpy as np, tempfile
+          from pathlib import Path
+          from football_insights.config import ModelSettings
+          from football_insights.models.temporal import train_temporal
+          from football_insights.models.export_onnx import export, check_parity
+
+          rng = np.random.default_rng(0)
+          x = rng.normal(size=(600, 50, 39)).astype(np.float32)
+          y = (x[:, -1, 0] > 0).astype(np.int8)
+          settings = ModelSettings(max_epochs=2, hidden_size=16, early_stopping_patience=2)
+          model, _ = train_temporal(x[:500], y[:500], x[500:], y[500:], settings)
+
+          with tempfile.TemporaryDirectory() as tmp:
+              path = export(model, Path(tmp) / "m.onnx")
+              report = check_parity(model, path, x[:128])
+          print(report)
+          assert report["within_tolerance"], report
+          assert report["max_rank_change"] == 0, report
+          PY
+
+      - name: Service smoke test
+        run: |
+          python - <<'PY'
+          from fastapi.testclient import TestClient
+          from football_insights.config import Settings
+          from football_insights.data.synthetic import generate_synthetic_match
+          from football_insights.models.heuristic import HeuristicPredictor
+          from football_insights.serving.app import create_app
+          from football_insights.serving.engine import InsightEngine
+          from football_insights.serving.metrics import Metrics
+
+          settings = Settings()
+          match = generate_synthetic_match(seed=5, period_duration_s=30.0)
+          metrics = Metrics()
+          engine = InsightEngine(
+              settings=settings, orientation=match.orientation, events=match.events,
+              frame_rate=match.frame_rate, predictor=HeuristicPredictor(), metrics=metrics,
+          )
+          client = TestClient(create_app(settings, engine, None, metrics))
+          assert client.get("/health").status_code == 200
+          assert client.get("/ready").json()["ready"] is True
+          body = client.get("/metrics").text
+          assert "fi_model_predictions_total" in body
+          assert "fi_insight_suppressed_total" in body
+          print("service smoke test ok")
+          PY
+
+  security:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
+
+      - name: Audit dependencies
+        # Advisory: a new CVE in a transitive dependency should surface without
+        # blocking an unrelated pull request.
+        continue-on-error: true
+        run: pip-audit --progress-spinner off
+
+  demo:
+    name: Build the demo
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: demo/package.json
+      - run: npm install
+        working-directory: demo
+      - run: npm run build
+        working-directory: demo
+
+  container:
+    name: Build the container
+    runs-on: ubuntu-latest
+    # This job is the only verification the image gets: it has never been built
+    # on the development machine, which has no Docker daemon. Stated in README.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: football-insights:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+      - name: Check the CLI responds inside the image
+        run: docker run --rm football-insights:ci info
