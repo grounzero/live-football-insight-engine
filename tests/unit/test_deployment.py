@@ -63,6 +63,29 @@ if TYPE_CHECKING:
 NOWHERE = Path("/nonexistent/football-insights/should-not-exist")
 
 
+@pytest.fixture
+def built_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend the Vite build ran.
+
+    Public-mode readiness depends on the built page being present, and that page
+    is a git-ignored build artifact: it exists on a machine where `make
+    demo-build` has been run and nowhere else. CI's Python job never runs npm,
+    so a test that took the real filesystem answer asserted the developer's
+    working tree — passing locally and failing in CI for a reason that has
+    nothing to do with the behaviour under test.
+
+    Tests that care about UI presence state it, in one direction or the other,
+    with this or `no_demo` below.
+    """
+    monkeypatch.setattr(app_module, "_mount_demo", _demo_page_present)
+
+
+@pytest.fixture
+def no_demo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Pretend the Vite build did not run. See `built_demo`."""
+    monkeypatch.setattr(app_module, "_mount_demo", _no_demo_page)
+
+
 def _public_settings(tmp_path: Path) -> Settings:
     """Settings shaped like the container's, with nothing available on disk."""
     settings = Settings()
@@ -257,7 +280,7 @@ class TestSyntheticSource:
 class TestPublicStartup:
     """Starting with no dataset, and with or without a model artifact."""
 
-    def test_it_starts_with_no_data_and_no_registry(self, tmp_path: Path) -> None:
+    def test_it_starts_with_no_data_and_no_registry(self, tmp_path: Path, built_demo: None) -> None:
         app = create_configured_app(_public_settings(tmp_path), speed=0.0)
 
         with TestClient(app) as raw:
@@ -267,7 +290,9 @@ class TestPublicStartup:
         assert body["mode"] == "public_demo"
         assert body["data_source"] == "synthetic"
 
-    def test_without_an_artifact_it_says_so_rather_than_pretending(self, tmp_path: Path) -> None:
+    def test_without_an_artifact_it_says_so_rather_than_pretending(
+        self, tmp_path: Path, built_demo: None
+    ) -> None:
         """The fallback path, proven rather than assumed.
 
         An image whose model failed to build still starts — that is the point of
@@ -310,7 +335,9 @@ class TestPublicStartup:
 class TestReadinessSemantics:
     """What readiness answers, and when."""
 
-    def test_it_is_ready_before_any_stream_client_connects(self, tmp_path: Path) -> None:
+    def test_it_is_ready_before_any_stream_client_connects(
+        self, tmp_path: Path, built_demo: None
+    ) -> None:
         """The condition a deployment health check depends on.
 
         The replay task starts on the first subscriber. If an idle replay counted
@@ -331,9 +358,8 @@ class TestReadinessSemantics:
             assert client.get("/ready").json()["ready"] is True
 
     def test_a_missing_page_is_not_ready_in_public_mode(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, tmp_path: Path, no_demo: None
     ) -> None:
-        monkeypatch.setattr(app_module, "_mount_demo", _no_demo_page)
         app = create_configured_app(_public_settings(tmp_path), speed=0.0)
 
         with TestClient(app) as raw:
@@ -345,10 +371,9 @@ class TestReadinessSemantics:
         assert response.json()["reason"] == "demo page not built"
 
     def test_a_missing_page_is_fine_outside_public_mode(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+        self, tmp_path: Path, no_demo: None
     ) -> None:
         """An API-only deployment is legitimate and must stay ready."""
-        monkeypatch.setattr(app_module, "_mount_demo", _no_demo_page)
         settings = Settings()
         settings.paths.artifacts_dir = tmp_path
         engine, metrics = _engine(settings)
@@ -360,7 +385,9 @@ class TestReadinessSemantics:
         assert body["ready"] is True
         assert body["mode"] == "local"
 
-    def test_the_payload_carries_no_paths_or_fingerprints(self, tmp_path: Path) -> None:
+    def test_the_payload_carries_no_paths_or_fingerprints(
+        self, tmp_path: Path, built_demo: None
+    ) -> None:
         """It is served unauthenticated on a public URL."""
         app = create_configured_app(_public_settings(tmp_path), speed=0.0)
 
@@ -471,6 +498,15 @@ class TestMetricCardinality:
 def _no_demo_page(_app: FastAPI) -> bool:
     """Stand in for `_mount_demo` on a build where the page was never built."""
     return False
+
+
+def _demo_page_present(_app: FastAPI) -> bool:
+    """Stand in for `_mount_demo` on a build where the page is present.
+
+    Nothing is actually mounted: no test here fetches a static file, and the
+    container smoke test covers real static serving against the real image.
+    """
+    return True
 
 
 def _oversized_chunks() -> Iterator[bytes]:

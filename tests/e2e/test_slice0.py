@@ -312,6 +312,38 @@ class TestReplayRestart:
             out.append(json.loads(message.data))
         return out
 
+    @staticmethod
+    async def _drain_to_restart(
+        queue: asyncio.Queue[StreamMessage], limit: int = 2000
+    ) -> list[JsonDict]:
+        """Drain up to and including the next restart marker.
+
+        Not a fixed message count, and the difference is what makes these tests
+        stable. The replay publishes far faster than a test consumes, so by the
+        time a restart is requested the queue already holds a backlog of frames
+        published *before* it — up to the 256-slot limit. The marker goes in
+        behind that backlog, so a fixed window of 120 messages reads only frames
+        that predate the restart and concludes the marker never arrived. It is
+        pure scheduling: it passes on an idle machine and fails on a loaded CI
+        runner, where the consumer falls further behind.
+
+        The marker itself cannot be lost — it is published as critical, which
+        evicts the oldest queued message rather than dropping itself — so
+        draining until it appears always terminates. The limit is a guard
+        against a genuine failure to publish, not a timing allowance.
+
+        Returns:
+            Every message drained, the restart marker last.
+        """
+        out: list[JsonDict] = []
+        while len(out) < limit:
+            message = await asyncio.wait_for(queue.get(), timeout=10.0)
+            payload = json.loads(message.data)
+            out.append(payload)
+            if payload["type"] == "restart":
+                return out
+        pytest.fail(f"no restart marker in {limit} messages")
+
     async def test_restart_rebuilds_engine_state(self, settings: Settings) -> None:
         """A held pre-restart frame must never reach the rewound engine.
 
@@ -329,6 +361,8 @@ class TestReplayRestart:
             before = await self._drain(queue, 120)
             player.reset()
             state.request_restart()
+            # Everything queued before the restart, ending at the marker itself.
+            through_restart = await self._drain_to_restart(queue)
             after = await self._drain(queue, 120)
         finally:
             player.stop()
@@ -338,7 +372,7 @@ class TestReplayRestart:
             "the replay scored nothing even before restarting, so the assertion below is vacuous"
         )
 
-        markers = [m for m in after if m["type"] == "restart"]
+        markers = [m for m in through_restart + after if m["type"] == "restart"]
         assert len(markers) == 1, f"expected exactly one restart marker, saw {len(markers)}"
 
         # Scoring has to be *sustained*, which is why several rollups are checked
@@ -348,7 +382,10 @@ class TestReplayRestart:
         # scored on the way past. That lone decision lands in the first rollup
         # and makes a one-rollup assertion pass while the restarted replay is in
         # fact dead for the next two hundred frames.
-        tail = self._rollups(after[after.index(markers[0]) :])
+        #
+        # `after` begins immediately past the marker, so every rollup in it
+        # describes the restarted replay.
+        tail = self._rollups(after)
         assert len(tail) >= 3, "too few rollups followed the restart to judge"
         for position, rollup in enumerate(tail[:3]):
             assert self._reviewed(rollup) > 0, (
@@ -367,7 +404,11 @@ class TestReplayRestart:
             await self._drain(queue, 5)
             player.reset()
             state.request_restart()
-            await self._drain(queue, 40)
+            # Wait for the restart to actually be applied, not for a fixed
+            # number of messages: the history is cleared by the replay loop when
+            # it takes the request, and a fixed drain can be satisfied entirely
+            # by frames queued before it.
+            await self._drain_to_restart(queue)
         finally:
             player.stop()
 
