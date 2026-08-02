@@ -40,15 +40,28 @@ if TYPE_CHECKING:
 #: the two must never be confused in a registry, a log line or a status payload.
 DEMO_MODEL_NAME: Final = "demo-synthetic-gru"
 
-#: Fixtures to generate. Three matches of ten minutes a half gives a few
-#: thousand labelled windows, which is enough for a small GRU to learn the
-#: signal the generator puts there and little enough to train in about a minute.
-DEMO_MATCHES: Final = 3
+#: Fixtures per tactical archetype: one to fit on, one to early-stop and choose
+#: a threshold on.
+#:
+#: Split by whole fixture rather than by window, because a 5 s window at a 0.5 s
+#: stride overlaps its neighbours by 90% — splitting windows would put a
+#: sample's own neighbours on both sides of the boundary and turn early stopping
+#: into a measurement of memorisation. Splitting by *profile* instead would be a
+#: different mistake: the model would be validated on an archetype it had never
+#: seen, so early stopping would rank generalisation across tactics rather than
+#: fit, and the threshold would be chosen against a distribution the model was
+#: not trained for.
+DEMO_FIXTURES_PER_PROFILE: Final = 2
 DEMO_PERIOD_DURATION_S: Final = 600.0
 
-#: Held out for early stopping. One whole match rather than a slice of each, so
-#: the split cannot leak a window's neighbours across it.
-DEMO_VALIDATION_MATCHES: Final = 1
+#: Base seed for the development fixtures.
+#:
+#: Deliberately nowhere near
+#: :data:`~football_insights.serving.loader.PUBLIC_FIXTURE_SEED_BASE`, so the
+#: six fixtures this model is built from and the three the hosted demo plays
+#: cannot overlap. A test asserts the two sets are disjoint rather than trusting
+#: the arithmetic to stay that way.
+DEMO_SEED_BASE: Final = 20260801
 
 DEMO_NOTES: Final = (
     "Trained only on generated synthetic tracking data, for the hosted demonstration. "
@@ -58,8 +71,19 @@ DEMO_NOTES: Final = (
 )
 
 
-def _prepared_fixtures(settings: Settings, seed: int) -> list[MatchData]:
-    """Generate the fixtures and turn each into a modelling dataset.
+def training_seed(offset: int) -> int:
+    """Seed for the development fixture at ``offset``.
+
+    Named and exported so the disjointness from the public rotation's seeds can
+    be asserted rather than assumed. The hosted fixtures must never be ones this
+    model was fitted, early-stopped or thresholded on — a demo scoring its own
+    training data is not a demonstration of anything.
+    """
+    return DEMO_SEED_BASE + offset
+
+
+def _prepared_fixtures(settings: Settings, seed: int) -> tuple[list[MatchData], list[MatchData]]:
+    """Generate the development fixtures and turn each into a modelling dataset.
 
     Produces the same :class:`MatchData` that a prepared Metrica match becomes,
     so threshold selection below is the identical code path the reference run
@@ -70,33 +94,37 @@ def _prepared_fixtures(settings: Settings, seed: int) -> list[MatchData]:
         seed: Base seed. Each fixture uses a distinct derived seed.
 
     Returns:
-        One dataset per fixture, in generation order.
+        The training and validation datasets, split by whole fixture with one
+        of each per tactical archetype.
     """
     from football_insights.data.pipeline import prepare_parsed_match
-    from football_insights.data.synthetic import generate_synthetic_match
+    from football_insights.data.synthetic import PROFILES, generate_synthetic_match
     from football_insights.features.window import WindowGeometry
     from football_insights.models.train import MatchData
 
-    out: list[MatchData] = []
-    for index in range(DEMO_MATCHES):
-        match_id = f"Synthetic_Train_{index}"
-        match = generate_synthetic_match(
-            seed=seed + index,
-            n_periods=2,
-            period_duration_s=DEMO_PERIOD_DURATION_S,
-        )
-        prepared = prepare_parsed_match(
-            match_id,
-            match.tracking,
-            match.events,
-            match.orientation,
-            settings,
-        )
-        geometry = WindowGeometry.build(settings.window, match.frame_rate)
-        labels = prepared.labels
-        times = labels.time_s
-        out.append(
-            MatchData(
+    train: list[MatchData] = []
+    validate: list[MatchData] = []
+    for profile_index, profile in enumerate(PROFILES):
+        for replicate in range(DEMO_FIXTURES_PER_PROFILE):
+            index = profile_index * DEMO_FIXTURES_PER_PROFILE + replicate
+            match_id = f"Synthetic_Train_{profile.key}_{replicate}"
+            match = generate_synthetic_match(
+                seed=seed + index,
+                n_periods=2,
+                period_duration_s=DEMO_PERIOD_DURATION_S,
+                profile=profile,
+            )
+            prepared = prepare_parsed_match(
+                match_id,
+                match.tracking,
+                match.events,
+                match.orientation,
+                settings,
+            )
+            geometry = WindowGeometry.build(settings.window, match.frame_rate)
+            labels = prepared.labels
+            times = labels.time_s
+            data = MatchData(
                 match_id=match_id,
                 windows=prepared.windows(geometry.observation_frames, geometry.sequence_length),
                 labels=labels.label.astype(np.int8),
@@ -107,11 +135,14 @@ def _prepared_fixtures(settings: Settings, seed: int) -> list[MatchData]:
                 episode_teams=np.array([int(e.team == Team.AWAY) for e in labels.episodes]),
                 minutes=float(times.max() - times.min()) / 60.0 if times.size else 90.0,
             )
-        )
-    return out
+            # The last replicate of each profile is the held-out one, so every
+            # archetype is represented on both sides of the split.
+            target = validate if replicate == DEMO_FIXTURES_PER_PROFILE - 1 else train
+            target.append(data)
+    return train, validate
 
 
-def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = 20260801) -> JsonDict:
+def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = DEMO_SEED_BASE) -> JsonDict:
     """Train a small model on generated data and export it to ONNX.
 
     Deterministic for a fixed seed: the fixtures come from a seeded generator and
@@ -131,16 +162,16 @@ def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = 20260801)
         DataValidationError: If the fixtures yield too few positives to train on,
             or the exported graph disagrees with the model it came from.
     """
+    from football_insights.data.synthetic import PROFILES
     from football_insights.models.evaluate import choose_threshold_by_alarm_budget
     from football_insights.models.export_onnx import check_parity, export
     from football_insights.models.temporal import train_temporal
 
-    fixtures = _prepared_fixtures(settings, seed)
-    split = len(fixtures) - DEMO_VALIDATION_MATCHES
-    train_windows = np.concatenate([m.windows for m in fixtures[:split]])
-    train_labels = np.concatenate([m.labels for m in fixtures[:split]]).astype(np.float32)
-    val_windows = np.concatenate([m.windows for m in fixtures[split:]])
-    val_labels = np.concatenate([m.labels for m in fixtures[split:]]).astype(np.float32)
+    train_fixtures, val_fixtures = _prepared_fixtures(settings, seed)
+    train_windows = np.concatenate([m.windows for m in train_fixtures])
+    train_labels = np.concatenate([m.labels for m in train_fixtures]).astype(np.float32)
+    val_windows = np.concatenate([m.windows for m in val_fixtures])
+    val_labels = np.concatenate([m.labels for m in val_fixtures]).astype(np.float32)
 
     positives = int(train_labels.sum())
     if positives < 2 or int(val_labels.sum()) < 1:
@@ -149,7 +180,7 @@ def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = 20260801)
         msg = (
             f"generated fixtures produced too few positive windows to train on "
             f"({positives} in training, {int(val_labels.sum())} in validation). "
-            "Increase DEMO_MATCHES or DEMO_PERIOD_DURATION_S."
+            "Increase DEMO_FIXTURES_PER_PROFILE or DEMO_PERIOD_DURATION_S."
         )
         raise DataValidationError(msg)
 
@@ -158,9 +189,16 @@ def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = 20260801)
     # Smaller and shorter than the reference run. This model is trained inside a
     # container build, where minutes are the budget, and it is demonstrating the
     # path rather than competing on a metric.
-    tuned.model.hidden_size = 32
-    tuned.model.max_epochs = 12
-    tuned.model.early_stopping_patience = 3
+    # Smaller and shorter than the reference run, but not as small as it was.
+    # The operating point comes from a false-alarm budget, so the only honest
+    # way to make the demo say more is to make the model *better* at the
+    # entries it is confident about — lowering the threshold to fill the
+    # silence would be manufacturing alarms the budget exists to prevent.
+    # Richer motion also gives the features more to separate on, which a
+    # 32-unit model trained for 12 epochs could not exploit.
+    tuned.model.hidden_size = 48
+    tuned.model.max_epochs = 30
+    tuned.model.early_stopping_patience = 6
 
     predictor, history = train_temporal(
         train_windows,
@@ -168,8 +206,11 @@ def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = 20260801)
         val_windows,
         val_labels,
         tuned.model,
-        training_matches=tuple(f"Synthetic_Train_{i}" for i in range(split)),
-        dataset_fingerprint=f"synthetic:seed={seed}:matches={DEMO_MATCHES}",
+        training_matches=tuple(m.match_id for m in train_fixtures),
+        dataset_fingerprint=(
+            f"synthetic:seed={seed}:profiles={'+'.join(p.key for p in PROFILES)}"
+            f":per_profile={DEMO_FIXTURES_PER_PROFILE}"
+        ),
         config_fingerprint=tuned.fingerprint(),
     )
 
@@ -190,7 +231,7 @@ def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = 20260801)
                 m.episode_teams,
                 m.minutes,
             )
-            for m in fixtures[:split]
+            for m in train_fixtures
         ],
         horizon_s=settings.window.horizon_s,
         settings=settings.episode,
