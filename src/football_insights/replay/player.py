@@ -211,7 +211,6 @@ class ReplayPlayer:
             self._position += 1
             self._match_time_s = item.frame.time_s
 
-            paced = False
             if self._speed > 0:
                 if self._origin is None:
                     self._origin = item.frame.time_s
@@ -220,24 +219,29 @@ class ReplayPlayer:
                 delay = target - (time.perf_counter() - self._started)
                 if delay > 0:
                     await asyncio.sleep(delay)
-                    paced = True
-
-            # Yield control periodically whenever the pacing sleep did not.
-            #
-            # That sleep is the only thing returning control to the event loop on
-            # the paced path, and it disappears the moment the replay falls
-            # behind schedule: `delay` goes negative, nothing is awaited, and
-            # resuming an async generator does not reach the scheduler. The loop
-            # then runs the entire match in one uninterrupted burst — no frame
-            # reaches a subscriber, `/health` and `/ready` do not answer, and a
-            # platform watching those decides the container is dead.
-            #
-            # Falling behind is not an edge case: it is what happens whenever
-            # per-frame work exceeds the budget the speed implies, which at 8x
-            # is 5 ms a frame and under coverage instrumentation is routinely
-            # less. The unpaced branch below has always guarded against this;
-            # the paced one needs the same guard for the same reason.
-            if not paced and self._position % 64 == 0:
+                else:
+                    # Behind schedule. The pacing sleep is the only thing that
+                    # returns control to the event loop on this path, and it is
+                    # exactly what disappears here: `delay` goes negative,
+                    # nothing is awaited, and resuming an async generator does
+                    # not reach the scheduler. The loop then runs the whole
+                    # match in one burst — no frame reaches a subscriber,
+                    # `/health` and `/ready` do not answer, and a platform
+                    # watching those decides the container is dead.
+                    #
+                    # Every frame, not every Nth. A consumer takes one message
+                    # per turn of the loop, so yielding once per N frames caps
+                    # delivery at one message per N frames however much is
+                    # queued — on Python 3.11, where `asyncio.wait_for` wraps
+                    # its argument in a task, that applies even to a queue with
+                    # hundreds of messages ready. A replay that is already
+                    # missing its deadline is not the place to save a
+                    # microsecond.
+                    await asyncio.sleep(0)
+            elif self._position % 64 == 0:
+                # Unpaced, so throughput is the whole point and there is no
+                # deadline to miss. Yield rarely, purely so an offline replay
+                # cannot starve the loop outright.
                 await asyncio.sleep(0)
 
             yield item
