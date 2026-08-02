@@ -42,6 +42,13 @@ export default function App() {
   // that only a public deployment can make.
   const showTransport = capabilities?.replay_controls !== false
 
+  // Which fixture is playing comes from the frames themselves — each one names
+  // its own — so it is right the moment the pitch changes rather than one poll
+  // of `/replay/status` later. The wording comes from the catalogue, which is
+  // the service's copy of it, not the page's.
+  const currentFixture = stream.frame?.fixture ?? replay?.match_id ?? null
+  const fixture = matches.find((m) => m.id === currentFixture)
+
   const { onRestart, onSelectMatch } = useReplayActions({
     restart,
     selectMatch,
@@ -61,9 +68,11 @@ export default function App() {
         showDiagnostics={showDiagnostics}
         onToggleDiagnostics={onToggleDiagnostics}
         matches={showTransport ? matches : []}
-        currentMatch={replay?.match_id ?? null}
+        currentMatch={currentFixture}
         onSelectMatch={onSelectMatch}
         switching={switching}
+        fixtureName={fixture?.name ?? null}
+        fixtureNarrative={fixture?.narrative ?? null}
       />
 
       <main>

@@ -265,6 +265,32 @@ test('the pipeline panel says what these stages cost before anyone presses one',
   assert.match(text, /data\/ and artifacts\//)
 })
 
+test('the header names the fixture currently playing', () => {
+  const markup = render(
+    <Header
+      ready
+      matches={[]}
+      fixtureName="High press and turnovers"
+      fixtureNarrative="Compressed shape, quick turnovers and short possessions."
+    />,
+  )
+  const text = visibleText(markup)
+
+  // The public demo rotates three archetypes and offers no way to choose
+  // between them, so without this nothing explains why the football just
+  // changed character.
+  assert.match(text, /High press and turnovers/)
+  assert.match(text, /quick turnovers and short possessions/)
+})
+
+test('the header claims no fixture before the service has named one', () => {
+  const text = visibleText(render(<Header ready matches={[]} />))
+
+  // A placeholder would put "Unknown" in the header on every load.
+  assert.doesNotMatch(text, /Unknown/)
+  assert.match(text, /Live Football Insight Engine/)
+})
+
 test('the public notice states the replay speed and why the controls are gone', () => {
   const text = visibleText(render(<ReadOnlyNotice speed={4} />))
 

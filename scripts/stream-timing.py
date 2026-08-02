@@ -172,18 +172,45 @@ def _frame_report(report: Report, window_s: float) -> list[str]:
         f"  bandwidth              {sum(f.bytes for f in frames) / span / 1024:.1f} kB/s",
     ]
 
-    times = [float(f.payload.get("match_time_s", 0.0)) for f in frames]
-    ids = [int(f.payload.get("frame", 0)) for f in frames]
-    laps = {int(f.payload.get("lap", 0)) for f in frames}
+    # Ordering is only an invariant *within* one fixture and lap. A rotation or
+    # a wrap restarts the source clock at zero and reuses the same frame
+    # numbers, so checking the whole capture reports a fault every time the
+    # demo does the thing it is supposed to do.
+    segments: list[list[Sample]] = []
+    previous_key: tuple[object, object] | None = None
+    for frame in frames:
+        key = (frame.payload.get("fixture"), frame.payload.get("lap"))
+        if key != previous_key:
+            segments.append([])
+            previous_key = key
+        segments[-1].append(frame)
+
+    disordered = []
+    for segment in segments:
+        times = [float(f.payload.get("match_time_s", 0.0)) for f in segment]
+        ids = [int(f.payload.get("frame", 0)) for f in segment]
+        if times != sorted(times) or ids != sorted(ids) or len(set(ids)) != len(ids):
+            disordered.append(segment[0].payload.get("fixture", "?"))
+
+    # Measured per segment and averaged, for the same reason.
+    rates = [
+        (
+            float(s[-1].payload.get("match_time_s", 0.0))
+            - float(s[0].payload.get("match_time_s", 0.0))
+        )
+        / (s[-1].arrived_s - s[0].arrived_s)
+        for s in segments
+        if len(s) > 1 and s[-1].arrived_s > s[0].arrived_s
+    ]
+    fixtures = [s[0].payload.get("fixture", "?") for s in segments]
+    order = "monotonic" if not disordered else f"OUT OF ORDER in {disordered}"
+    speed = f"{sum(rates) / len(rates):.2f}x" if rates else "n/a"
+    reported = frames[-1].payload.get("speed", "?")
     lines += [
-        f"  source time            {times[0]:.2f}s -> {times[-1]:.2f}s"
-        f"  ({'monotonic' if times == sorted(times) else 'OUT OF ORDER'})",
-        f"  source frame ids       {'monotonic' if ids == sorted(ids) else 'OUT OF ORDER'},"
-        f" {len(set(ids))} distinct of {len(ids)}",
-        f"  effective replay speed {(times[-1] - times[0]) / span:.2f}x"
-        f"  (reported {frames[-1].payload.get('speed', '?')}x)",
-        f"  fixture                {frames[-1].payload.get('fixture', '?')}"
-        f"  laps seen {sorted(laps)}",
+        f"  segments               {len(segments)} (fixture/lap changes: {len(segments) - 1})",
+        f"  ordering within each   {order}",
+        f"  effective replay speed {speed}  (reported {reported}x)",
+        f"  fixtures seen          {' -> '.join(dict.fromkeys(str(f) for f in fixtures))}",
     ]
     _ = window_s
     return lines

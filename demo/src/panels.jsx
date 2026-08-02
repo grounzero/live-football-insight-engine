@@ -91,6 +91,29 @@ function MatchPicker({ matches, current, disabled, onSelect }) {
   )
 }
 
+/**
+ * Which of the rotating fixtures is on, and what it is meant to look like.
+ *
+ * The public demo cycles three tactical archetypes and offers no way to choose
+ * between them, so the picker above is absent and nothing else on the page
+ * would say why the football just changed character. Both strings come from the
+ * service's own catalogue rather than being written here, so a fixture added or
+ * renamed in the generator cannot leave the page describing the wrong one.
+ *
+ * Rendered only once the name is known. A placeholder would put "Unknown" in
+ * the header for the first moments of every load, which is worse than a header
+ * that grows by one line a beat later.
+ */
+function CurrentFixture({ name, narrative }) {
+  if (!name) return null
+  return (
+    <div className="current-fixture">
+      <span className="fixture-name">{name}</span>
+      {narrative ? <span className="fixture-narrative">{narrative}</span> : null}
+    </div>
+  )
+}
+
 export function Header({
   ready,
   readyReason,
@@ -100,6 +123,8 @@ export function Header({
   currentMatch,
   onSelectMatch,
   switching,
+  fixtureName,
+  fixtureNarrative,
 }) {
   const { label, tone } = readinessOf(ready)
   return (
@@ -112,6 +137,7 @@ export function Header({
         </p>
       </div>
       <div className="header-controls">
+        <CurrentFixture name={fixtureName} narrative={fixtureNarrative} />
         <MatchPicker
           matches={matches ?? []}
           current={currentMatch}

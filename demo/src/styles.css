@@ -135,6 +135,14 @@ h1 { font-size: var(--text-xl); margin: 0 0 var(--space-2); letter-spacing: -0.0
 .match-picker select:hover:not(:disabled) { border-color: var(--accent); }
 .match-picker select:disabled { opacity: 0.45; cursor: not-allowed; }
 
+/* Which of the rotating fixtures is on. Right-aligned and stacked so it sits
+   with the other header controls without pushing the readiness pill around as
+   the name changes length at every changeover. */
+.current-fixture { display: flex; flex-direction: column; text-align: right; gap: 2px; }
+.fixture-name { font-size: var(--text-sm); font-weight: 600; color: var(--text); }
+.fixture-narrative { font-size: var(--text-xs); color: var(--muted); max-width: 34ch; }
+@media (max-width: 900px) { .current-fixture { text-align: left; } }
+
 .status-pill {
   padding: var(--space-2) var(--space-4); border-radius: var(--radius-pill);
   font-size: var(--text-sm); font-weight: 600;
