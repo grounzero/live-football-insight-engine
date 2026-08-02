@@ -166,22 +166,39 @@ test('a missing ball does not become a position', () => {
   assert.equal(sample.ball, null)
 })
 
+test('no blend crosses a period barrier', () => {
+  // Half time swaps the ends the teams attack, so blending the last frame of
+  // one period into the first of the next walks twenty-two players across the
+  // halfway line in a single step. The clock stays monotonic here, so the
+  // buffer keeps both frames and holds rather than discarding its runway.
+  const later = { ...frame(1.2, { period: 2 }), home: [[100, 0], [110, 5]] }
+  const playout = bufferAt([frame(1.0, { x: 0 }), later])
+
+  const held = playout.sampleAt(1.1)
+  assert.deepEqual(held.home[0], [0, 0])
+  assert.equal(held.interpolated, undefined)
+
+  const after = playout.sampleAt(1.25)
+  assert.deepEqual(after.home[0], [100, 0])
+})
+
 for (const [label, later] of [
   ['lap', frame(1.2, { lap: 1 })],
-  ['period', frame(1.2, { period: 2 })],
   ['fixture', frame(1.2, { fixture: 'Synthetic_Demo_Counter' })],
 ]) {
-  test(`no blend crosses a ${label} barrier`, () => {
+  test(`a ${label} change makes a blend across it impossible`, () => {
+    // Stronger than refusing to blend at sample time: the previous replay is
+    // dropped outright, so there is no pair to blend and no ordering assumption
+    // to get wrong. Its clock has rewound, and its positions describe a match
+    // that is no longer on screen.
     const playout = bufferAt([frame(1.0, { x: 0 }), { ...later, home: [[100, 0], [110, 5]] }])
 
-    // Held, not blended: the earlier position stays on screen until the clock
-    // genuinely reaches the far side.
-    const held = playout.sampleAt(1.1)
-    assert.deepEqual(held.home[0], [0, 0])
-    assert.equal(held.interpolated, undefined)
-
-    const after = playout.sampleAt(1.25)
-    assert.deepEqual(after.home[0], [100, 0])
+    assert.equal(playout.stats().depth, 1)
+    assert.equal(playout.stats().lastReset, 'barrier')
+    for (const t of [1.1, 1.2, 1.25]) {
+      assert.deepEqual(playout.sampleAt(t).home[0], [100, 0])
+      assert.equal(playout.sampleAt(t).interpolated, undefined)
+    }
   })
 }
 
@@ -281,6 +298,51 @@ test('a 500 ms outage freezes and then recovers without moving backwards', () =>
   for (let i = 1; i < seen.length; i += 1) {
     assert.ok(seen[i] >= seen[i - 1], 'the clock moved backwards during recovery')
   }
+})
+
+test('a lap wrap recovers even if the barrier message never arrives', () => {
+  // Measured against the live deployment: the fixture loops, the source clock
+  // rewinds to zero, and every frame of the new lap is behind where the render
+  // clock has reached. Without this the staleness check rejects all of them and
+  // the pitch freezes permanently — a 1.4 s stall was visible in a 45 s capture
+  // before the buffer learned to act on the frame's own lap.
+  const playout = createPlayout()
+  for (let i = 0; i <= 10; i += 1) playout.push(frame(480 + i * 0.05, { lap: 0 }))
+  for (let i = 0; i < 40; i += 1) playout.advance(0.016)
+
+  // The new lap, with no reset() call in between.
+  const accepted = playout.push(frame(0.04, { lap: 1, x: 42 }))
+
+  assert.equal(accepted, true, 'the first frame of a new lap was rejected as stale')
+  assert.equal(playout.stats().lastReset, 'barrier')
+  assert.equal(playout.stats().depth, 1, 'the previous lap was left in the buffer')
+
+  for (let i = 1; i < 10; i += 1) playout.push(frame(0.04 + i * 0.05, { lap: 1, x: 42 }))
+  const drawn = playout.sampleAt(playout.renderTime())
+  assert.ok(drawn, 'nothing could be drawn after the wrap')
+  assert.equal(drawn.lap, 1)
+})
+
+test('a fixture change recovers the same way', () => {
+  const playout = createPlayout()
+  for (let i = 0; i <= 10; i += 1) playout.push(frame(100 + i * 0.05, { fixture: 'A' }))
+  for (let i = 0; i < 40; i += 1) playout.advance(0.016)
+
+  assert.equal(playout.push(frame(0.04, { fixture: 'B' })), true)
+  assert.equal(playout.sampleAt(playout.renderTime()).fixture, 'B')
+})
+
+test('a period change does not discard a buffer that is still valid', () => {
+  // The clock stays monotonic across half time, so holding and then snapping is
+  // correct and cheaper than throwing away the runway that absorbs jitter.
+  const playout = createPlayout()
+  for (let i = 0; i <= 6; i += 1) playout.push(frame(1.0 + i * 0.05, { period: 1 }))
+  const before = playout.stats().depth
+
+  playout.push(frame(1.4, { period: 2 }))
+
+  assert.equal(playout.stats().depth, before + 1)
+  assert.notEqual(playout.stats().lastReset, 'barrier')
 })
 
 test('reset clears the buffer and unsets the clock', () => {

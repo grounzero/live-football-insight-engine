@@ -189,6 +189,24 @@ export function createPlayout({
       if (!sample || typeof sample.match_time_s !== 'number') return false
       received += 1
 
+      // A new lap or fixture rewinds the source clock, so every frame of it is
+      // "older" than where the render clock currently sits and the staleness
+      // check below would reject all of them — the pitch would freeze for good.
+      //
+      // The barrier message says so too, and is published as critical precisely
+      // so it cannot be dropped. Acting on the frame's own identity as well
+      // costs one comparison and removes the dependence on two cadences
+      // arriving in the right order, which is the kind of coupling that holds
+      // until the day it does not. Period changes are deliberately excluded:
+      // they keep the clock monotonic, so `sampleAt` can hold and then snap
+      // without discarding a buffer that is still valid.
+      const newest = samples[samples.length - 1]
+      if (newest && (newest.lap !== sample.lap || newest.fixture !== sample.fixture)) {
+        samples = []
+        renderT = null
+        lastReset = 'barrier'
+      }
+
       if (renderT !== null && sample.match_time_s < renderT) {
         dropped += 1
         return false
