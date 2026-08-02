@@ -1,8 +1,8 @@
-# Data card — Metrica Sports sample data
+# Data card: Metrica Sports sample data
 
 ## Source and access
 
-[github.com/metrica-sports/sample-data](https://github.com/metrica-sports/sample-data) — three
+[github.com/metrica-sports/sample-data](https://github.com/metrica-sports/sample-data): three
 anonymised matches of optical tracking with synchronised event annotation, published by Metrica
 Sports as a sample of their commercial product.
 
@@ -57,8 +57,8 @@ timestamps. No resampling is applied at ingestion; the model input is subsampled
 
 Fully anonymised by the publisher: no player, team or competition names. Players appear as shirt
 numbers (CSV) or opaque ids such as `P3578` (EPTS). Nothing in this project attempts to
-de-anonymise them, and features are deliberately identity-invariant — players are ordered by
-distance to ball or goal, never by shirt number — so a model cannot learn a specific individual.
+de-anonymise them, and features are deliberately identity-invariant: players are ordered by
+distance to ball or goal, never by shirt number, so a model cannot learn a specific individual.
 
 ## Playing direction
 
@@ -66,15 +66,15 @@ distance to ball or goal, never by shirt number — so a model cannot learn a sp
 
 Sample game 3 declares `attack_direction_first_half` per team in its metadata, and labels each
 player's `position_type` including which is the goalkeeper. Games 1 and 2 declare **neither**.
-Direction also differs between the two CSV matches — the home team attacks `+x` in the first half
-of game 1 and `−x` in the first half of game 2 — so no convention can be assumed.
+Direction also differs between the two CSV matches. The home team attacks `+x` in the first half
+of game 1 and `−x` in the first half of game 2, so no convention can be assumed.
 
 Direction is therefore inferred from a ranked hierarchy of evidence (metadata → pass progression →
 goalkeeper position and team centroid → shot geometry), reconciled by weighted vote, and written
 to `artifacts/reports/direction_<match>.json` with every signal and its margin.
 
 Because game 3 declares the answer, it serves as ground truth for the inference used on the other
-two. With the declaration withheld, the inferred direction matches it for all four team-periods —
+two. With the declaration withheld, the inferred direction matches it for all four team-periods,
 asserted by `tests/unit/test_orientation.py::TestGameThreeGroundTruth`.
 
 Two structural facts are enforced regardless of the vote: the two teams cannot attack the same end,
@@ -84,10 +84,10 @@ and a team must change ends between halves. Either violation stops preparation.
 
 Measured, not assumed:
 
-- **Ball position is absent in a large fraction of frames** — 39% in game 1. But 68% of those fall
+- **Ball position is absent in a large fraction of frames**, 39% in game 1. But 68% of those fall
   in dead-ball periods: the ball simply is not tracked while play is stopped. Restricted to in-play
   frames the rate is 18.0%, 24.6% and 27.2% for games 1, 2 and 3. Part of the remainder is genuine
-  dropout and part is the dead-ball mask being approximate — it ends a stoppage at the next on-ball
+  dropout and part is the dead-ball mask being approximate: it ends a stoppage at the next on-ball
   event, while the ball often is not tracked until slightly after.
 - **Substitutes.** The CSV format carries fixed columns with `NaN` for players not on the pitch. The
   EPTS format writes only the eleven on the pitch, with column meaning changing at each of eleven
@@ -95,7 +95,7 @@ Measured, not assumed:
   column means the same player all match.
 - **Event taxonomy differs.** Game 3 includes `CARRY` events that games 1 and 2 do not. Nothing in
   the label or feature path may depend on `CARRY` being present.
-- **Game 3 does not start at frame 1** — there is pre-kickoff footage. Frames outside the declared
+- **Game 3 does not start at frame 1**, because there is pre-kickoff footage. Frames outside the declared
   period boundaries are discarded rather than assigned to a period.
 - Goalkeepers are **declared** in game 3 and **inferred** in games 1 and 2 (as the outfield-extreme
   player). Which applies is recorded per player, so a report never implies the source said something
@@ -107,7 +107,7 @@ Nothing is invented. Missing observations are never interpolated:
 
 - Absent players remain `NaN` and are excluded from aggregates.
 - A window with fewer than 80% valid frames, or whose final frame lacks the ball, is structurally
-  invalid — it is never scored and can never produce an insight.
+  invalid: it is never scored and can never produce an insight.
 - File-level validation fails outright on unordered frames, backwards timestamps, implausible
   coordinates (>2% of samples more than 5 m off-pitch, which indicates a wrong coordinate
   convention rather than dropout), or events that do not align with the tracking frame range.
@@ -133,5 +133,5 @@ that responds to the ball, and a consistent event stream. It can also be written
 exact CSV layout so the production parser is exercised against the real on-disk format.
 
 It is football-shaped, not football: box entries occur roughly twice as often as in the real data,
-which is deliberate — it gives small fixtures enough positives to assert on. It is **not** used for
-any reported metric.
+which is deliberate, because it gives small fixtures enough positives to assert on. It is **not**
+used for any reported metric.

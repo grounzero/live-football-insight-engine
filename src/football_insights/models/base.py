@@ -62,7 +62,7 @@ class ModelMetadata:
     dataset_fingerprint: str | None = None
     config_fingerprint: str | None = None
     training_matches: tuple[str, ...] = ()
-    metrics: dict[str, float] = field(default_factory=dict)
+    metrics: dict[str, float] = field(default_factory=dict[str, float])
     notes: str = ""
 
     @classmethod

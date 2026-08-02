@@ -25,6 +25,7 @@ import torch
 from torch import nn
 
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC, FeatureSpec
+from football_insights.models._torch_typing import seed_torch, tensor_from
 from football_insights.models.base import ModelMetadata, validate_batch
 from football_insights.types import JsonDict
 
@@ -43,7 +44,7 @@ def seed_everything(seed: int) -> None:
     """
     random.seed(seed)
     np.random.seed(seed)
-    torch.manual_seed(seed)
+    seed_torch(seed)
     torch.use_deterministic_algorithms(mode=True, warn_only=True)
 
 
@@ -199,7 +200,7 @@ class TemporalPredictor:
         batch = validate_batch(windows, self._metadata)
         standardised = self._standardiser.apply(batch)
         with torch.no_grad():
-            tensor = torch.from_numpy(standardised).to(self._device)
+            tensor = tensor_from(standardised).to(self._device)
             logits = self._model(tensor)
             return torch.sigmoid(logits).squeeze(-1).cpu().numpy().astype(np.float64)
 
@@ -328,9 +329,9 @@ def train_temporal(
     device = select_device(prefer_gpu)
     standardiser = Standardiser.fit(train_windows)
 
-    x_train = torch.from_numpy(standardiser.apply(train_windows))
-    y_train = torch.from_numpy(train_labels.astype(np.float32)).unsqueeze(1)
-    x_val = torch.from_numpy(standardiser.apply(val_windows)).to(device)
+    x_train = tensor_from(standardiser.apply(train_windows))
+    y_train = tensor_from(train_labels.astype(np.float32)).unsqueeze(1)
+    x_val = tensor_from(standardiser.apply(val_windows)).to(device)
     y_val = val_labels.astype(np.int8)
 
     model = GRUClassifier(
@@ -361,16 +362,16 @@ def train_temporal(
             loss = criterion(model(batch_x), batch_y)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimiser.step()
+            # Optimizer.step is declared with an unannotated `closure` parameter
+            # in torch 2.13, so the no-closure call reads as partially unknown.
+            optimiser.step()  # pyright: ignore[reportUnknownMemberType]
             losses.append(float(loss.item()))
 
         model.eval()
         with torch.no_grad():
             logits = model(x_val)
             val_loss = float(
-                criterion(
-                    logits, torch.from_numpy(y_val.astype(np.float32)).unsqueeze(1).to(device)
-                )
+                criterion(logits, tensor_from(y_val.astype(np.float32)).unsqueeze(1).to(device))
             )
             probabilities = torch.sigmoid(logits).squeeze(-1).cpu().numpy()
         score = (

@@ -14,7 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
@@ -22,6 +22,43 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 PredictorKind = Literal["heuristic", "logistic", "gbdt", "gru"]
 InferenceBackend = Literal["torch", "onnx"]
+
+
+def _parse_yaml_mapping(text: str, source: Path) -> dict[str, Any]:
+    """Parse a YAML document into a string-keyed mapping.
+
+    This is where the ``Any`` that ``yaml.safe_load`` returns stops: everything
+    downstream of it is a validated Pydantic model. YAML also permits non-string
+    mapping keys (``1: x``, ``true: y``), which would otherwise surface much
+    later as an unreadable ``TypeError`` from ``Settings(**data)``.
+
+    Args:
+        text: Raw YAML source.
+        source: Path the text came from, used in error messages.
+
+    Returns:
+        The document as a string-keyed mapping; empty for an empty document.
+
+    Raises:
+        TypeError: If the document is not a mapping, or has a non-string key.
+    """
+    document: object = yaml.safe_load(text)
+    if document is None:
+        return {}
+    if not isinstance(document, dict):
+        msg = f"configuration file {source} must contain a mapping"
+        raise TypeError(msg)
+    # isinstance() cannot recover the element types of a dict[Unknown, Unknown];
+    # the cast states what a YAML mapping actually is, and the loop below is the
+    # check that makes it true rather than assumed.
+    entries = cast("dict[object, object]", document)
+    parsed: dict[str, Any] = {}
+    for key, value in entries.items():
+        if not isinstance(key, str):
+            msg = f"configuration file {source}: mapping keys must be strings, got {key!r}"
+            raise TypeError(msg)
+        parsed[key] = value
+    return parsed
 
 
 class PathSettings(BaseModel):
@@ -168,6 +205,16 @@ class ServiceSettings(BaseModel):
     #: Emitted in structured logs and echoed on responses for correlation.
     service_name: str = "football-insights"
     cors_origins: tuple[str, ...] = ("http://localhost:5173",)
+    #: Expose the pipeline stages (acquire, prepare, train, evaluate, benchmark)
+    #: as job endpoints, and the panel that drives them.
+    #:
+    #: Off by default, and the routes are not registered at all when it is off.
+    #: The service has no authentication and mounts the demo at ``/``, so anyone
+    #: who can reach the port could otherwise start a 180 MB download and pin the
+    #: CPU for minutes. That is fine on a development machine and is not fine in
+    #: the published container, so turning it on is a deliberate act:
+    #: ``serve --dev-tools`` or ``FI_SERVICE__ENABLE_PIPELINE_CONTROLS=1``.
+    enable_pipeline_controls: bool = False
 
 
 class Settings(BaseSettings):
@@ -274,11 +321,7 @@ class Settings(BaseSettings):
             if not config_path.is_file():
                 msg = f"configuration file not found: {config_path}"
                 raise FileNotFoundError(msg)
-            loaded = yaml.safe_load(config_path.read_text()) or {}
-            if not isinstance(loaded, dict):
-                msg = f"configuration file {config_path} must contain a mapping"
-                raise TypeError(msg)
-            data = loaded
+            data = _parse_yaml_mapping(config_path.read_text(), config_path)
         for key, value in overrides.items():
             if value is not None:
                 data[key] = value

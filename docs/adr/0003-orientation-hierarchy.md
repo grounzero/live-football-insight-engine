@@ -1,4 +1,4 @@
-# ADR 0003 — Infer playing direction from ranked evidence, and fail loudly
+# ADR 0003: Infer playing direction from ranked evidence, and fail loudly
 
 **Status:** accepted · **Date:** 2026-08-01
 
@@ -8,7 +8,7 @@ Getting playing direction wrong inverts every spatial feature, and does so silen
 runs, the model trains, the results are meaningless.
 
 The three sample matches are not uniform. Game 3 (EPTS) declares `attack_direction_first_half` and
-labels goalkeepers. Games 1 and 2 (CSV) declare neither, and the two disagree with each other —
+labels goalkeepers. Games 1 and 2 (CSV) declare neither, and the two disagree with each other,
 the home team attacks `+x` in the first half of game 1 and `−x` in the first half of game 2.
 
 ## Decision
@@ -33,7 +33,8 @@ An override exists but requires a written reason, which is echoed into the audit
 - Shot geometry is corroboration, not evidence. One team-period in game 3 has three shots; pass
   progression draws on hundreds of events and carries that period.
 - Game 3 becomes a ground-truth fixture. With its declaration withheld, the inference reproduces it
-  for all four team-periods — direct evidence that the inference used on games 1 and 2 is right.
+  for all four team-periods, which is direct evidence that the inference used on games 1 and 2 is
+  right.
 - The audit artifact is written before any failure, so a rejected match is still diagnosable.
 - Development cost: the structural check caught a genuine sign error in the team-centroid signal
   (a team is anchored near the goal it *defends*, so it attacks away from its centroid). A single

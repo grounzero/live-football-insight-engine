@@ -5,7 +5,7 @@ FI := .venv/bin/football-insights
 TEST_MATCH ?= Sample_Game_2
 
 .PHONY: help setup data prepare train evaluate export benchmark drift serve demo demo-build \
-        test test-fast slice0 lint typecheck format audit check clean reference
+        test test-fast slice0 lint typecheck pyright format audit check codehealth clean reference
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -66,10 +66,22 @@ format: ## Auto-format and fix with ruff
 typecheck: ## Static type check with mypy
 	$(PY) -m mypy
 
-audit: ## Check dependencies for known vulnerabilities
-	$(PY) -m pip_audit --strict --ignore-vuln GHSA-none || true
+pyright: ## Strict static type check with pyright
+	$(PY) -m pyright
 
-check: lint typecheck test ## Lint, type check and test
+audit: ## Check dependencies for known vulnerabilities
+	# --skip-editable: this project is installed editable and is not published on
+	# PyPI, so auditing it only ever reports "not found" — nothing about our
+	# actual exposure. --strict is deliberately absent: it fails the run when
+	# dependency *collection* fails, and skipping the editable install counts as
+	# exactly that, so the two cannot be combined. Findings still fail the target
+	# (pip-audit exits 1 on any advisory), and the exit status is not swallowed.
+	$(PY) -m pip_audit --skip-editable
+
+check: lint typecheck pyright test ## Lint, type check and test
+
+codehealth: ## CodeScene code-health delta (needs the cs CLI and a PAT)
+	./scripts/codescene.sh
 
 clean: ## Remove caches and build artifacts (leaves data/ and artifacts/)
 	rm -rf .pytest_cache .mypy_cache .ruff_cache htmlcov .coverage build dist

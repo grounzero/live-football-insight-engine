@@ -27,6 +27,8 @@ from football_insights.features.spec import DEFAULT_FEATURE_SPEC, FeatureSpec
 from football_insights.models.base import ModelMetadata
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from sklearn.base import BaseEstimator
 
 BaselineKind = Literal["logistic", "gbdt"]
@@ -140,7 +142,9 @@ def build_estimator(kind: BaselineKind, seed: int, class_weight: float | None) -
     Returns:
         The estimator.
     """
-    weights = "balanced" if class_weight is None else {0: 1.0, 1: class_weight}
+    weights: Mapping[int, float] | Literal["balanced"] = (
+        "balanced" if class_weight is None else {0: 1.0, 1: class_weight}
+    )
     if kind == "logistic":
         return Pipeline(
             [
@@ -233,7 +237,7 @@ def logistic_coefficients(
         ``(name, coefficient)`` pairs ordered by absolute value.
     """
     estimator = predictor.estimator
-    model = estimator.named_steps["model"] if hasattr(estimator, "named_steps") else estimator
+    model = estimator.named_steps["model"] if isinstance(estimator, Pipeline) else estimator
     coefficients = np.asarray(model.coef_).ravel()
     names = summary_feature_names(spec)
     order = np.argsort(np.abs(coefficients))[::-1][:top]

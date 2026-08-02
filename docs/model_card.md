@@ -1,4 +1,4 @@
-# Model card — penalty-area entry predictor
+# Model card: penalty-area entry predictor
 
 Last updated with the reference run of 2026-08-01. Reproduce with `make reference`.
 
@@ -26,7 +26,7 @@ worth showing, and it is expected to remain in place.
 
 ## Task and label
 
-At prediction time `t`, positive if and only if the ball — with the attacking team in possession —
+At prediction time `t`, positive if and only if the ball (with the attacking team in possession)
 crosses from outside into the opposition penalty area during `(t, t + 5 s]`.
 
 - Observation window 5 s, horizon 5 s, stride 0.5 s, resampled to 10 Hz (50 timesteps). All
@@ -46,7 +46,7 @@ scores a tame ball into the corner of the area identically to a cut-back to the 
 
 ## Training data
 
-Metrica Sports sample data — three anonymised matches, 25 Hz optical tracking with synchronised
+Metrica Sports sample data: three anonymised matches, 25 Hz optical tracking with synchronised
 events. 27,557 samples, 1,598 positive (5.80%), 196 episodes. See
 [data_card.md](data_card.md) for provenance, licensing and known quality issues.
 
@@ -70,7 +70,7 @@ Reference run (train games 1 + 3, test game 2), GRU: PR-AUC 0.569, Brier 0.128, 
 threshold 0.93.
 
 **On the baseline comparison, stated plainly:** on window PR-AUC the GRU's advantage over the
-baselines is marginal — the folds overlap, logistic regression wins one of three, and the mean gap
+baselines is marginal: the folds overlap, logistic regression wins one of three, and the mean gap
 (0.519 vs 0.499) sits inside the fold-to-fold spread. The GRU's real advantage is confined to the
 operating point the product needs, where it holds 0.68 episode precision at 6–18 false alarms per
 90 minutes against 23–76 for the baselines, because its probabilities are smoother in time and
@@ -84,7 +84,7 @@ views of the same attack as ten observations. Both are reported.
 Chosen on training matches only, then frozen before the held-out match is scored.
 
 The criterion is a **false-alarm budget**, not a window-precision target. Targeting window
-precision of 0.30 was measured to produce ~140 false alarms per 90 minutes — roughly one every
+precision of 0.30 was measured to produce ~140 false alarms per 90 minutes, roughly one every
 forty seconds, which no viewer-facing product could use. The binding constraint is how often the
 system may interrupt, so that is what the threshold is set from; recall is whatever the budget
 affords.
@@ -106,15 +106,15 @@ point, not a claim about likelihood.
 
 ## Known limitations and failure modes
 
-- **Warning time 1.22 s median** — enough to precede the event, still short for a broadcast
+- **Warning time 1.22 s median.** Enough to precede the event, still short for a broadcast
   insight. This is the direct cost of buying precision with a high threshold and is the model's
   main practical weakness.
-- **Recall 0.59** — four in ten box entries pass unflagged.
+- **Recall 0.59.** Four in ten box entries pass unflagged.
 - **The threshold does not transfer exactly.** Fitted to ≤12 false alarms / 90 min on two matches,
   it produced 14.5 on the third. A useful reminder of how little two matches constrain an operating
   point.
 - **Three matches, 196 episodes.** Fold spread is wide; no interval captures between-match variance.
-- **Bootstrap recall intervals are biased low** — resampled duplicate episodes cannot all be
+- **Bootstrap recall intervals are biased low**, because resampled duplicate episodes cannot all be
   matched under one-to-one alarm matching. Precision and false-alarm intervals are unaffected.
 - **Set pieces and restarts** are excluded from training, so behaviour around them is untested.
 - **Possession lags** real turnovers, because it can only change once the next event has started.
@@ -133,8 +133,8 @@ model. Three mitigations are built in rather than left to policy:
    assertions.
 2. Factual context ("3 attackers ahead of the ball") is measured from the same window and kept
    separate from the hedged headline, so the insight is concrete without over-claiming.
-3. The system emits nothing when it cannot support a claim — invalid window, missing model, schema
-   mismatch, ball out of play — and records why.
+3. The system emits nothing when it cannot support a claim, whether that is an invalid window, a
+   missing model, a schema mismatch or the ball being out of play, and records why.
 
 ## Human oversight
 

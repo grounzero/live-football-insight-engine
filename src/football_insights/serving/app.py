@@ -5,11 +5,23 @@ Endpoints
 ``GET  /health``           liveness; always 200 while the process is up.
 ``GET  /ready``            readiness; false until a predictor is loaded and its
                            feature schema matches this build.
+``GET  /capabilities``     which optional surfaces this process exposes.
 ``GET  /model``            active model metadata, including ``is_ml``.
 ``GET  /replay/status``    replay position, fault profile and seed.
+``GET  /replay/matches``   the match catalogue and which of them are on disk.
 ``POST /predict``          score an explicit window.
-``GET  /insights/stream``  server-sent events: frames, predictions, insights.
+``POST /replay/control``   pause, resume, re-pace or restart the replay.
+``POST /replay/match``     replay a different match, in place.
+``GET  /insights/stream``  server-sent events. Every message is event name
+                           ``update``; the JSON ``type`` discriminates between
+                           ``frame``, ``insight``, ``suppression`` (an exact
+                           per-reason rollup), ``restart``, ``match`` and
+                           ``end``.
 ``GET  /metrics``          Prometheus exposition.
+
+The pipeline job routes under ``/jobs`` are registered only when
+``service.enable_pipeline_controls`` is set; see
+:mod:`football_insights.serving.jobs`.
 
 Liveness and readiness are deliberately distinct. A service with no model is
 alive and will answer, but is not ready, and says so rather than quietly
@@ -19,15 +31,13 @@ returning zeros that a caller might mistake for confident predictions.
 from __future__ import annotations
 
 import asyncio
-import contextlib
-import json
 import logging
-from dataclasses import dataclass, field
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Any
 
 import numpy as np
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -37,9 +47,11 @@ from sse_starlette.sse import EventSourceResponse
 
 from football_insights.config import Settings
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
-from football_insights.insight.types import Insight
+from football_insights.serving.loader import available_matches
 from football_insights.serving.logging import configure_logging, new_correlation_id
 from football_insights.serving.metrics import Metrics
+from football_insights.serving.state import AppState, get_state
+from football_insights.serving.switching import mount_pipeline_jobs, swap_match
 from football_insights.types import JsonDict
 
 if TYPE_CHECKING:
@@ -53,10 +65,6 @@ LOGGER = logging.getLogger("football_insights.serving")
 #: Starlette renamed this constant; resolve it once so the service works on
 #: either version without emitting a deprecation warning.
 HTTP_422 = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
-
-#: Frames are sent to the browser at this rate regardless of tracking rate;
-#: 25 Hz of JSON per client is wasteful and invisible to the eye.
-FRAME_PUBLISH_HZ = 12.5
 
 
 class PredictRequest(BaseModel):
@@ -88,10 +96,28 @@ class PredictRequest(BaseModel):
 
 
 class ReplayCommand(BaseModel):
-    """Pause/resume and pacing control for the replay."""
+    """Pause/resume, pacing and rewind control for the replay."""
 
     paused: bool | None = None
     speed: float | None = Field(default=None, ge=0.0, le=200.0)
+    #: Rewind to the first frame and rebuild all rolling state. A plain bool
+    #: rather than the tri-state the others use: for a command, "not requested"
+    #: and "requested false" mean the same thing, where for a setting they do
+    #: not.
+    restart: bool = False
+
+
+class MatchCommand(BaseModel):
+    """Request to replay a different match.
+
+    Deliberately not a field on :class:`ReplayCommand`. Switching match is slow
+    and destructive where the others are instant and idempotent, it needs its
+    own not-found and already-in-progress answers, and a single command carrying
+    both a match and a speed would be ambiguous about which player the speed was
+    meant for.
+    """
+
+    match: str
 
 
 class PredictResponse(BaseModel):
@@ -105,51 +131,6 @@ class PredictResponse(BaseModel):
     is_ml: bool
     feature_schema: str
     inference_ms: float
-
-
-@dataclass
-class AppState:
-    """Objects shared across requests."""
-
-    settings: Settings
-    metrics: Metrics
-    engine: InsightEngine | None = None
-    player: ReplayPlayer | None = None
-    recent_insights: list[Insight] = field(default_factory=list)
-    _subscribers: set[asyncio.Queue[str]] = field(default_factory=set)
-    _task: asyncio.Task[None] | None = None
-
-    def subscribe(self) -> asyncio.Queue[str]:
-        """Register a new SSE subscriber."""
-        queue: asyncio.Queue[str] = asyncio.Queue(maxsize=256)
-        self._subscribers.add(queue)
-        return queue
-
-    def unsubscribe(self, queue: asyncio.Queue[str]) -> None:
-        """Remove an SSE subscriber."""
-        self._subscribers.discard(queue)
-
-    def publish(self, payload: str, *, critical: bool = False) -> None:
-        """Fan out a message, dropping it for any subscriber that has fallen behind.
-
-        A slow browser tab must never stall the replay loop, so a full queue
-        loses the message rather than applying back pressure. Control messages
-        pass ``critical=True``: losing an end marker would leave that client
-        waiting forever, so one slot is made for it by discarding the oldest
-        pending frame.
-        """
-        for queue in list(self._subscribers):
-            if queue.full():
-                if not critical:
-                    continue
-                with contextlib.suppress(asyncio.QueueEmpty):
-                    queue.get_nowait()
-            queue.put_nowait(payload)
-
-
-def get_state(request: Request) -> AppState:
-    """FastAPI dependency returning the shared application state."""
-    return request.app.state.fi  # type: ignore[no-any-return]
 
 
 def create_app(
@@ -201,46 +182,60 @@ def create_app(
         allow_headers=["*"],
     )
 
-    @app.middleware("http")
-    async def _correlate(request: Request, call_next: Any) -> Response:
-        incoming = request.headers.get("x-correlation-id")
-        cid = incoming or new_correlation_id()
-        response: Response = await call_next(request)
-        response.headers["x-correlation-id"] = cid
-        state.metrics.requests.labels(
-            endpoint=request.url.path,
-            method=request.method,
-            status=str(response.status_code),
-        ).inc()
-        return response
+    app.middleware("http")(_correlate)
+    app.add_exception_handler(RequestValidationError, _validation_error)
 
-    @app.exception_handler(RequestValidationError)
-    async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-        """Return a safe 422 instead of echoing the rejected payload.
-
-        FastAPI's default handler includes the offending input in the response.
-        That breaks outright on values JSON cannot represent — a window
-        containing ``Infinity`` makes serialising the *error* fail — and echoing
-        arbitrary client input back is not something a public endpoint should do
-        anyway. Only the location and message are returned.
-        """
-        return JSONResponse(
-            status_code=HTTP_422,
-            content={
-                "detail": [
-                    {
-                        "loc": [str(part) for part in error.get("loc", ())],
-                        "msg": str(error.get("msg", "invalid value")),
-                        "type": str(error.get("type", "value_error")),
-                    }
-                    for error in exc.errors()
-                ]
-            },
-        )
-
-    _register_routes(app, state)
+    for router in (OPS_ROUTER, MODEL_ROUTER, REPLAY_ROUTER, INSIGHT_ROUTER):
+        app.include_router(router)
+    mount_pipeline_jobs(app, state)
+    # Last: the demo is mounted at `/`, which would shadow anything registered
+    # after it.
     _mount_demo(app)
     return app
+
+
+async def _correlate(request: Request, call_next: Any) -> Response:
+    """Stamp every response with a correlation id and count it."""
+    incoming = request.headers.get("x-correlation-id")
+    cid = incoming or new_correlation_id()
+    response: Response = await call_next(request)
+    response.headers["x-correlation-id"] = cid
+    state: AppState = request.app.state.fi
+    state.metrics.requests.labels(
+        endpoint=request.url.path,
+        method=request.method,
+        status=str(response.status_code),
+    ).inc()
+    return response
+
+
+async def _validation_error(_: Request, exc: Exception) -> JSONResponse:
+    """Return a safe 422 instead of echoing the rejected payload.
+
+    FastAPI's default handler includes the offending input in the response.
+    That breaks outright on values JSON cannot represent — a window
+    containing ``Infinity`` makes serialising the *error* fail — and echoing
+    arbitrary client input back is not something a public endpoint should do
+    anyway. Only the location and message are returned.
+
+    Starlette types its exception handlers against the base ``Exception``, so the
+    concrete type is narrowed here rather than in the signature.
+    """
+    if not isinstance(exc, RequestValidationError):  # pragma: no cover - defensive
+        raise exc
+    return JSONResponse(
+        status_code=HTTP_422,
+        content={
+            "detail": [
+                {
+                    "loc": [str(part) for part in error.get("loc", ())],
+                    "msg": str(error.get("msg", "invalid value")),
+                    "type": str(error.get("type", "value_error")),
+                }
+                for error in exc.errors()
+            ]
+        },
+    )
 
 
 def _mount_demo(app: FastAPI) -> None:
@@ -257,240 +252,234 @@ def _mount_demo(app: FastAPI) -> None:
     app.mount("/", StaticFiles(directory=static_dir, html=True), name="demo")
 
 
-def _register_routes(app: FastAPI, state: AppState) -> None:
-    """Attach the route handlers."""
+# ---------------------------------------------------------------- routers
+#
+# Routers are built at module level, one per resource, rather than as closures
+# inside a single registration function. That keeps each handler independently
+# readable and testable, and means shared state arrives the same way everywhere
+# — through the `get_state` dependency — instead of being captured from an
+# enclosing scope by some handlers and injected into others.
 
-    @app.get("/health", tags=["ops"])
-    async def health() -> dict[str, str]:
-        """Liveness probe."""
-        return {"status": "ok", "service": state.settings.service.service_name}
+OPS_ROUTER = APIRouter(tags=["ops"])
+MODEL_ROUTER = APIRouter(tags=["model"])
+REPLAY_ROUTER = APIRouter(prefix="/replay", tags=["replay"])
+INSIGHT_ROUTER = APIRouter(tags=["insight"])
 
-    @app.get("/ready", tags=["ops"])
-    async def ready(response: Response, st: Annotated[AppState, Depends(get_state)]) -> JsonDict:
-        """Readiness probe.
+StateDep = Annotated[AppState, Depends(get_state)]
 
-        Reports ``false`` when no predictor is loaded or its feature schema
-        disagrees with this build, rather than serving predictions that cannot
-        be trusted.
-        """
-        engine = st.engine
-        is_ready = engine is not None and engine.is_ready
-        if not is_ready:
-            response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
-        reason = "ok"
-        if engine is None:
-            reason = "no engine configured"
-        elif engine.predictor is None:
-            reason = "no predictor loaded"
-        elif not engine.is_ready:
-            reason = "feature schema mismatch"
-        st.metrics.ready.set(1 if is_ready else 0)
-        return {"ready": is_ready, "reason": reason}
 
-    @app.get("/model", tags=["model"])
-    async def model(st: Annotated[AppState, Depends(get_state)]) -> JsonDict:
-        """Metadata for the active predictor."""
-        if st.engine is None or st.engine.predictor is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="no predictor loaded",
-            )
-        meta = st.engine.predictor.metadata
-        payload = meta.to_dict()
-        payload["running_feature_schema"] = DEFAULT_FEATURE_SPEC.schema_hash
-        payload["schema_matches"] = meta.feature_schema_hash == DEFAULT_FEATURE_SPEC.schema_hash
-        payload["decision_threshold"] = st.settings.model.threshold
-        return payload
+@OPS_ROUTER.get("/health")
+async def health(st: StateDep) -> dict[str, str]:
+    """Liveness probe."""
+    return {"status": "ok", "service": st.settings.service.service_name}
 
-    @app.get("/replay/status", tags=["replay"])
-    async def replay_status(st: Annotated[AppState, Depends(get_state)]) -> JsonDict:
-        """Replay position, fault profile and seed."""
-        if st.player is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no replay configured"
-            )
-        return st.player.status().to_dict()
 
-    @app.post("/replay/control", tags=["replay"])
-    async def replay_control(
-        command: ReplayCommand, st: Annotated[AppState, Depends(get_state)]
-    ) -> JsonDict:
-        """Pause, resume or re-pace the replay."""
-        if st.player is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no replay configured"
-            )
-        if command.paused is not None:
-            st.player.set_paused(command.paused)
-        if command.speed is not None:
-            st.player.set_speed(command.speed)
-        return st.player.status().to_dict()
+@OPS_ROUTER.get("/ready")
+async def ready(response: Response, st: StateDep) -> JsonDict:
+    """Readiness probe.
 
-    @app.post("/predict", response_model=PredictResponse, tags=["model"])
-    async def predict(
-        request: PredictRequest, st: Annotated[AppState, Depends(get_state)]
-    ) -> PredictResponse:
-        """Score an explicit observation window."""
-        import time
+    Reports ``false`` when no predictor is loaded or its feature schema
+    disagrees with this build, rather than serving predictions that cannot
+    be trusted.
+    """
+    engine = st.engine
+    is_ready = engine is not None and engine.is_ready
+    if not is_ready:
+        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
+    reason = "ok"
+    if engine is None:
+        reason = "no engine configured"
+    elif engine.predictor is None:
+        reason = "no predictor loaded"
+    elif not engine.is_ready:
+        reason = "feature schema mismatch"
+    st.metrics.ready.set(1 if is_ready else 0)
+    return {"ready": is_ready, "reason": reason}
 
-        if st.engine is None or st.engine.predictor is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no predictor loaded"
-            )
-        predictor = st.engine.predictor
-        window = np.asarray(request.window, dtype=np.float32)
-        expected = DEFAULT_FEATURE_SPEC.n_features
-        if window.shape[1] != expected:
-            raise HTTPException(
-                status_code=HTTP_422,
-                detail=(
-                    f"expected {expected} features per timestep, got {window.shape[1]}; "
-                    f"feature schema is {DEFAULT_FEATURE_SPEC.schema_hash}"
-                ),
-            )
-        started = time.perf_counter()
-        try:
-            probability = float(predictor.predict_proba(window[None, ...])[0])
-        except ValueError as exc:
-            raise HTTPException(status_code=HTTP_422, detail=str(exc)) from exc
-        elapsed_ms = (time.perf_counter() - started) * 1000.0
-        meta = predictor.metadata
-        st.metrics.predictions.labels(model=meta.name, is_ml=str(meta.is_ml).lower()).inc()
-        st.metrics.confidence.labels(model=meta.name).observe(probability)
-        return PredictResponse(
-            probability=probability,
-            threshold=st.settings.model.threshold,
-            above_threshold=probability >= st.settings.model.threshold,
-            model_name=meta.name,
-            model_version=meta.version,
-            is_ml=meta.is_ml,
-            feature_schema=meta.feature_schema_hash,
-            inference_ms=elapsed_ms,
+
+@OPS_ROUTER.get("/capabilities")
+async def capabilities(st: StateDep) -> JsonDict:
+    """Which optional surfaces this process exposes.
+
+    The demo asks rather than guesses. Pipeline controls are off unless a
+    deployment turns them on, and a page that rendered the panel on the
+    assumption they were there would offer buttons that 404.
+    """
+    return {"pipeline_controls": st.settings.service.enable_pipeline_controls}
+
+
+@OPS_ROUTER.get("/metrics")
+async def metrics_endpoint(st: StateDep) -> Response:
+    """Prometheus exposition."""
+    payload, content_type = st.metrics.render()
+    return Response(content=payload, media_type=content_type)
+
+
+@MODEL_ROUTER.get("/model")
+async def model(st: StateDep) -> JsonDict:
+    """Metadata for the active predictor."""
+    if st.engine is None or st.engine.predictor is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="no predictor loaded",
         )
-
-    @app.get("/insights", tags=["insight"])
-    async def recent(st: Annotated[AppState, Depends(get_state)]) -> JsonDict:
-        """Insights emitted so far in this replay."""
-        return {"insights": [i.to_dict() for i in st.recent_insights[-20:]]}
-
-    @app.get("/metrics", tags=["ops"])
-    async def metrics_endpoint(st: Annotated[AppState, Depends(get_state)]) -> Response:
-        """Prometheus exposition."""
-        payload, content_type = st.metrics.render()
-        return Response(content=payload, media_type=content_type)
-
-    @app.get("/insights/stream", tags=["insight"])
-    async def stream(st: Annotated[AppState, Depends(get_state)]) -> EventSourceResponse:
-        """Server-sent events carrying frames, predictions and insights."""
-        if st.player is None or st.engine is None:
-            raise HTTPException(
-                status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no replay configured"
-            )
-        queue = st.subscribe()
-        _ensure_replay_task(st)
-
-        async def publisher() -> AsyncIterator[dict[str, str]]:
-            # The stream is finite when the replay is: on the end marker the
-            # generator returns, so the connection closes rather than hanging
-            # open on a queue that will never be fed again.
-            try:
-                while True:
-                    payload = await queue.get()
-                    yield {"event": "update", "data": payload}
-                    if '"type": "end"' in payload:
-                        return
-            except asyncio.CancelledError:  # pragma: no cover - client disconnect
-                raise
-            finally:
-                st.unsubscribe(queue)
-
-        return EventSourceResponse(publisher())
+    meta = st.engine.predictor.metadata
+    payload = meta.to_dict()
+    payload["running_feature_schema"] = DEFAULT_FEATURE_SPEC.schema_hash
+    payload["schema_matches"] = meta.feature_schema_hash == DEFAULT_FEATURE_SPEC.schema_hash
+    payload["decision_threshold"] = st.settings.model.threshold
+    # The demo names the horizon in its own copy. Exposing it keeps that
+    # sentence true if the window is ever retuned, where a hardcoded number in
+    # the frontend would quietly start lying.
+    payload["horizon_s"] = st.settings.window.horizon_s
+    return payload
 
 
-def _ensure_replay_task(state: AppState) -> None:
-    """Start the replay loop once, on first subscriber."""
-    if state._task is not None and not state._task.done():
-        return
-    state._task = asyncio.create_task(_run_replay(state))
-
-
-async def _run_replay(state: AppState) -> None:
-    """Drive the replay through the engine and publish results."""
-    player = state.player
-    engine = state.engine
-    if player is None or engine is None:
-        return
-    cid = new_correlation_id()
-    LOGGER.info(
-        "replay started",
-        extra={
-            "match_id": player.status().match_id,
-            "fault_profile": player.status().profile,
-            "seed": player.status().seed,
-            "speed": player.status().speed,
-            "correlation_id": cid,
-        },
-    )
-    publish_every = max(1, round(25.0 / FRAME_PUBLISH_HZ))
-    counter = 0
+@MODEL_ROUTER.post("/predict", response_model=PredictResponse)
+async def predict(request: PredictRequest, st: StateDep) -> PredictResponse:
+    """Score an explicit observation window."""
+    if st.engine is None or st.engine.predictor is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no predictor loaded"
+        )
+    predictor = st.engine.predictor
+    window = np.asarray(request.window, dtype=np.float32)
+    expected = DEFAULT_FEATURE_SPEC.n_features
+    if window.shape[1] != expected:
+        raise HTTPException(
+            status_code=HTTP_422,
+            detail=(
+                f"expected {expected} features per timestep, got {window.shape[1]}; "
+                f"feature schema is {DEFAULT_FEATURE_SPEC.schema_hash}"
+            ),
+        )
+    started = time.perf_counter()
     try:
-        async for emitted in player.stream(loop=state.settings.replay.loop):
-            result = engine.process(emitted.frame)
-            counter += 1
-
-            if result.outcome is not None and result.outcome.insight is not None:
-                insight = result.outcome.insight
-                state.recent_insights.append(insight)
-                state.publish(json.dumps({"type": "insight", "payload": insight.to_dict()}))
-                LOGGER.info(
-                    "insight emitted",
-                    extra={
-                        "kind": insight.kind.value,
-                        "probability": round(insight.probability, 3),
-                        "match_time_s": round(insight.match_time_s, 1),
-                        "is_ml": insight.is_ml,
-                    },
-                )
-
-            if counter % publish_every:
-                continue
-            frame = emitted.frame
-            probability = (
-                result.prediction.probability
-                if result.prediction and result.prediction.window_valid
-                else None
-            )
-            state.publish(
-                json.dumps(
-                    {
-                        "type": "frame",
-                        "payload": {
-                            "period": frame.period,
-                            "match_time_s": round(frame.time_s, 2),
-                            "home": _round_positions(frame.home_xy),
-                            "away": _round_positions(frame.away_xy),
-                            "ball": _round_positions(frame.ball_xy[None, :])[0],
-                            "probability": None if probability is None else round(probability, 4),
-                            "window_valid": bool(
-                                result.prediction.window_valid if result.prediction else False
-                            ),
-                        },
-                    }
-                )
-            )
-    except asyncio.CancelledError:  # pragma: no cover - shutdown
-        raise
-    finally:
-        state.publish(json.dumps({"type": "end", "payload": {"frames": counter}}), critical=True)
-        LOGGER.info("replay finished", extra={"frames": counter})
+        probability = float(predictor.predict_proba(window[None, ...])[0])
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTP_422, detail=str(exc)) from exc
+    elapsed_ms = (time.perf_counter() - started) * 1000.0
+    meta = predictor.metadata
+    st.metrics.predictions.labels(model=meta.name, is_ml=str(meta.is_ml).lower()).inc()
+    st.metrics.confidence.labels(model=meta.name).observe(probability)
+    return PredictResponse(
+        probability=probability,
+        threshold=st.settings.model.threshold,
+        above_threshold=probability >= st.settings.model.threshold,
+        model_name=meta.name,
+        model_version=meta.version,
+        is_ml=meta.is_ml,
+        feature_schema=meta.feature_schema_hash,
+        inference_ms=elapsed_ms,
+    )
 
 
-def _round_positions(xy: np.ndarray) -> list[list[float] | None]:
-    """Round coordinates for transport, replacing absent players with ``None``."""
-    out: list[list[float] | None] = []
-    for row in np.atleast_2d(xy):
-        if not np.all(np.isfinite(row)):
-            out.append(None)
-        else:
-            out.append([round(float(row[0]), 2), round(float(row[1]), 2)])
-    return out
+def _require_player(st: AppState) -> ReplayPlayer:
+    """The replay player, or a 503 when the service was started without one."""
+    if st.player is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no replay configured"
+        )
+    return st.player
+
+
+@REPLAY_ROUTER.get("/status")
+async def replay_status(st: StateDep) -> JsonDict:
+    """Replay position, fault profile and seed."""
+    return _require_player(st).status().to_dict()
+
+
+@REPLAY_ROUTER.get("/matches")
+async def replay_matches(st: StateDep) -> JsonDict:
+    """The match catalogue, and which of them this deployment can actually play."""
+    return {
+        "current": st.player.status().match_id if st.player is not None else None,
+        "matches": list(available_matches(st.settings.paths.raw_dir)),
+    }
+
+
+@REPLAY_ROUTER.post("/match")
+async def replay_match(command: MatchCommand, st: StateDep) -> JsonDict:
+    """Replay a different match, rebuilding the engine in place.
+
+    Roughly two seconds of blocking work, almost all of it parsing tracking
+    files, so it runs in a worker thread; holding the event loop for that long
+    would stall every other request and every open stream.
+    """
+    player = _require_player(st)
+    catalogue = available_matches(st.settings.paths.raw_dir)
+    if not any(m["id"] == command.match and m["available"] for m in catalogue):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"no playable match {command.match!r}; see GET /replay/matches",
+        )
+    # Checked before acquiring rather than by blocking on the lock: a second
+    # request should be told the service is busy, not held open for the two
+    # seconds the first one takes. Safe without a further guard because nothing
+    # awaits between the test and the acquisition.
+    if st.switch.locked():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail="a match switch is already in progress"
+        )
+    async with st.switch:
+        current = st.engine.predictor if st.engine is not None else None
+        return await swap_match(st, command.match, player.status(), current)
+
+
+@REPLAY_ROUTER.post("/control")
+async def replay_control(command: ReplayCommand, st: StateDep) -> JsonDict:
+    """Pause, resume, re-pace or restart the replay."""
+    player = _require_player(st)
+    if command.restart:
+        # Rewinding the player here rather than in the loop means `/replay/status`
+        # is correct straight away, and a replay whose task has already run to
+        # completion is back at frame 0 before a new task is started below.
+        #
+        # Resuming is not a convenience. A paused loop sits in a sleep and never
+        # takes another frame, so it would never reach the point where the
+        # engine-side half of the rewind is applied. An explicit `paused` in the
+        # same command is honoured below, so a restart-and-stay-paused still
+        # ends paused — it just rewinds first.
+        player.reset()
+        player.set_paused(False)
+        st.request_restart()
+        st.ensure_replay_task()
+    if command.paused is not None:
+        player.set_paused(command.paused)
+    if command.speed is not None:
+        player.set_speed(command.speed)
+    return player.status().to_dict()
+
+
+@INSIGHT_ROUTER.get("/insights")
+async def recent(st: StateDep) -> JsonDict:
+    """Insights emitted so far in this replay."""
+    return {"insights": [i.to_dict() for i in st.recent_insights[-20:]]}
+
+
+@INSIGHT_ROUTER.get("/insights/stream")
+async def stream(st: StateDep) -> EventSourceResponse:
+    """Server-sent events carrying frames, predictions and insights."""
+    if st.player is None or st.engine is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="no replay configured"
+        )
+    queue = st.subscribe()
+    st.ensure_replay_task()
+
+    async def publisher() -> AsyncIterator[dict[str, str]]:
+        # The stream is finite when the replay is: on the end marker the
+        # generator returns, so the connection closes rather than hanging
+        # open on a queue that will never be fed again.
+        try:
+            while True:
+                payload = await queue.get()
+                yield {"event": "update", "data": payload}
+                if '"type": "end"' in payload:
+                    return
+        except asyncio.CancelledError:  # pragma: no cover - client disconnect
+            raise
+        finally:
+            st.unsubscribe(queue)
+
+    return EventSourceResponse(publisher())

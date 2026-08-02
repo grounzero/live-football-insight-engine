@@ -22,9 +22,13 @@ import numpy as np
 import torch
 from torch import nn
 
+from football_insights.models._torch_typing import tensor_from
 from football_insights.types import JsonDict
 
 if TYPE_CHECKING:
+    import onnxruntime as ort
+
+    from football_insights.models.base import ModelMetadata
     from football_insights.models.temporal import TemporalPredictor
 
 #: Maximum absolute probability difference tolerated between runtimes.
@@ -47,8 +51,8 @@ class _ExportWrapper(nn.Module):
     def __init__(self, model: nn.Module, mean: np.ndarray, scale: np.ndarray) -> None:
         super().__init__()
         self.model = model
-        self.register_buffer("mean", torch.from_numpy(np.asarray(mean, dtype=np.float32)))
-        self.register_buffer("scale", torch.from_numpy(np.asarray(scale, dtype=np.float32)))
+        self.register_buffer("mean", tensor_from(np.asarray(mean, dtype=np.float32)))
+        self.register_buffer("scale", tensor_from(np.asarray(scale, dtype=np.float32)))
 
     def forward(self, window: torch.Tensor) -> torch.Tensor:
         """Score raw feature windows.
@@ -113,7 +117,9 @@ def export(
 
     example = torch.zeros(1, length, metadata.n_features, dtype=torch.float32)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.onnx.export(
+    # torch.onnx.export accepts ScriptFunction[..., Unknown] in its model union
+    # (torch 2.13), which makes the whole overload read as partially unknown.
+    torch.onnx.export(  # pyright: ignore[reportUnknownMemberType]
         wrapper,
         (example,),
         str(path),
@@ -126,7 +132,7 @@ def export(
     return path
 
 
-def load_session(path: Path) -> object:
+def load_session(path: Path) -> ort.InferenceSession:
     """Open an ONNX Runtime session pinned to CPU.
 
     CPU is the target: inference must fit inside a live latency budget where a
@@ -148,7 +154,7 @@ def load_session(path: Path) -> object:
 class OnnxPredictor:
     """An exported model served through ONNX Runtime."""
 
-    def __init__(self, path: Path, metadata: object) -> None:
+    def __init__(self, path: Path, metadata: ModelMetadata) -> None:
         """Open a session for an exported artifact.
 
         Args:
@@ -157,10 +163,10 @@ class OnnxPredictor:
         """
         self._session = load_session(path)
         self._metadata = metadata
-        self._input = self._session.get_inputs()[0].name  # type: ignore[attr-defined]
+        self._input = self._session.get_inputs()[0].name
 
     @property
-    def metadata(self) -> object:
+    def metadata(self) -> ModelMetadata:
         """Identity and provenance, shared with the PyTorch artifact."""
         return self._metadata
 
@@ -176,7 +182,7 @@ class OnnxPredictor:
         arr = np.asarray(windows, dtype=np.float32)
         if arr.ndim == 2:
             arr = arr[None, ...]
-        output = self._session.run(None, {self._input: arr})[0]  # type: ignore[attr-defined]
+        output = self._session.run(None, {self._input: arr})[0]
         return np.asarray(output).reshape(-1).astype(np.float64)
 
 

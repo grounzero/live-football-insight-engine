@@ -222,7 +222,7 @@ def replay(
             insight = result.outcome.insight
             emitted += 1
             typer.echo(
-                f"  [{insight.match_time_s:7.1f}s] {insight.headline} — {insight.detail} "
+                f"  [{insight.match_time_s:7.1f}s] {insight.headline}: {insight.detail} "
                 f"(p={insight.probability:.2f})"
             )
     _echo_json({"insights": emitted, "fault_summary": player.summary.to_dict()})
@@ -237,6 +237,10 @@ def serve(
     speed: Annotated[float, typer.Option(help="Replay rate; 1.0 is real time.")] = 8.0,
     host: Annotated[str | None, typer.Option()] = None,
     port: Annotated[int | None, typer.Option()] = None,
+    dev_tools: Annotated[
+        bool,
+        typer.Option(help="Expose the pipeline stages as job endpoints and a panel in the demo."),
+    ] = False,
 ) -> None:
     """Start the API and the viewer demo."""
     import uvicorn
@@ -244,6 +248,10 @@ def serve(
     from football_insights.serving.bootstrap import create_configured_app
 
     settings = _settings(config)
+    if dev_tools:
+        # Set here rather than defaulted on, so an operator who did not ask for
+        # the pipeline routes never gets them. See ServiceSettings for why.
+        settings.service.enable_pipeline_controls = True
     application = create_configured_app(settings, match, fault_profile, seed, speed)
     uvicorn.run(
         application,

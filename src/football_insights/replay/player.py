@@ -87,6 +87,12 @@ class ReplayPlayer:
         self._running = False
         self._paused = False
         self._match_time_s = 0.0
+        #: Pacing anchor: the match time and wall clock that the emission
+        #: schedule is measured from. Held on the instance rather than in
+        #: ``stream``'s frame so that a control request arriving on another task
+        #: can invalidate it — see :meth:`_drop_anchor`.
+        self._origin: float | None = None
+        self._started = 0.0
 
     @property
     def total_frames(self) -> int:
@@ -122,9 +128,21 @@ class ReplayPlayer:
         """Pause or resume emission without losing position."""
         self._paused = paused
 
+    def _drop_anchor(self) -> None:
+        """Forget the pacing anchor so the next frame re-anchors from now."""
+        self._origin = None
+
     def set_speed(self, speed: float) -> None:
-        """Change the replay rate. Pacing resets so the change takes effect at once."""
+        """Change the replay rate. Pacing resets so the change takes effect at once.
+
+        Dropping the anchor is the whole point: it describes a schedule computed
+        at the old rate, and dividing the match time replayed so far by a *lower*
+        speed would ask the loop to sleep off the difference — 21 s after only
+        3 s of playback going 8x to 1x, and proportionally worse the longer the
+        replay has run, which reads as the service having hung.
+        """
         self._speed = max(0.0, speed)
+        self._drop_anchor()
 
     @property
     def paused(self) -> bool:
@@ -136,9 +154,18 @@ class ReplayPlayer:
         self._running = False
 
     def reset(self) -> None:
-        """Rewind to the beginning."""
+        """Rewind to the beginning and re-anchor the pacing schedule.
+
+        Dropping the anchor is part of rewinding, not a separate courtesy. The
+        anchor describes a schedule measured from a match time the replay is
+        about to be far behind again, so every frame of the rewound stream looks
+        overdue and the loop emits them as fast as it can until it catches back
+        up — the same failure :meth:`set_speed` documents, arriving from the
+        other direction.
+        """
         self._position = 0
         self._match_time_s = 0.0
+        self._drop_anchor()
 
     async def stream(self, loop: bool = False) -> AsyncIterator[EmittedFrame]:
         """Yield frames at the configured pace.
@@ -150,22 +177,18 @@ class ReplayPlayer:
             Emitted frames, including duplicates and out-of-order arrivals.
         """
         self._running = True
-        started = time.perf_counter()
-        origin: float | None = None
+        self._drop_anchor()
 
         while self._running:
             if self._position >= len(self._emitted):
                 if not loop:
                     break
                 self.reset()
-                started = time.perf_counter()
-                origin = None
 
             if self._paused:
                 await asyncio.sleep(0.05)
-                # Re-anchor pacing so the pause is not "caught up" on resume.
-                origin = None
-                started = time.perf_counter()
+                # Re-anchor so the pause is not "caught up" on resume.
+                self._drop_anchor()
                 continue
 
             item = self._emitted[self._position]
@@ -173,11 +196,11 @@ class ReplayPlayer:
             self._match_time_s = item.frame.time_s
 
             if self._speed > 0:
-                if origin is None:
-                    origin = item.frame.time_s
-                    started = time.perf_counter()
-                target = (item.frame.time_s - origin) / self._speed + item.offset_s
-                delay = target - (time.perf_counter() - started)
+                if self._origin is None:
+                    self._origin = item.frame.time_s
+                    self._started = time.perf_counter()
+                target = (item.frame.time_s - self._origin) / self._speed + item.offset_s
+                delay = target - (time.perf_counter() - self._started)
                 if delay > 0:
                     await asyncio.sleep(delay)
             else:

@@ -13,11 +13,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, Self
+from typing import TYPE_CHECKING, Any, Final, Self
 
 import numpy as np
 
-from football_insights.types import JsonDict
+from football_insights.types import FloatArray, Int16Array, IntArray, JsonDict
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -197,12 +197,18 @@ class MatchTracking:
     spot; no per-team reorientation has been applied at this stage.
     """
 
-    period: np.ndarray
-    frame: np.ndarray
-    time_s: np.ndarray
-    home_xy: np.ndarray
-    away_xy: np.ndarray
-    ball_xy: np.ndarray
+    #: ``(n_frames,)`` period number, 1-based.
+    period: Int16Array
+    #: ``(n_frames,)`` source frame number.
+    frame: IntArray
+    #: ``(n_frames,)`` seconds from kick-off.
+    time_s: FloatArray
+    #: ``(n_frames, n_home_players, 2)`` metres.
+    home_xy: FloatArray
+    #: ``(n_frames, n_away_players, 2)`` metres.
+    away_xy: FloatArray
+    #: ``(n_frames, 2)`` metres; NaN where the ball is not tracked.
+    ball_xy: FloatArray
     home_players: tuple[PlayerRef, ...]
     away_players: tuple[PlayerRef, ...]
     frame_rate: float
@@ -239,7 +245,7 @@ class MatchTracking:
         """Player references for one team, in column order."""
         return self.home_players if team is Team.HOME else self.away_players
 
-    def team_xy(self, team: Team) -> np.ndarray:
+    def team_xy(self, team: Team) -> FloatArray:
         """Positions for one team, shape ``(n_frames, n_players, 2)``."""
         return self.home_xy if team is Team.HOME else self.away_xy
 
@@ -284,7 +290,7 @@ class Orientation:
     """
 
     directions: dict[tuple[int, Team], AttackDirection]
-    report: JsonDict = field(default_factory=dict)
+    report: JsonDict = field(default_factory=dict[str, Any])
 
     def direction(self, period: int, team: Team) -> AttackDirection:
         """Attacking direction for one team in one period."""
@@ -308,7 +314,7 @@ class Match:
     events: tuple[Event, ...]
     orientation: Orientation
     source_format: str
-    metadata: JsonDict = field(default_factory=dict)
+    metadata: JsonDict = field(default_factory=dict[str, Any])
 
     @property
     def frame_rate(self) -> float:

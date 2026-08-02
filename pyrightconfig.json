@@ -1,4 +1,22 @@
 {
+  // 3.12, not 3.11, for the same reason as [tool.mypy] in pyproject.toml:
+  // numpy's bundled stubs use PEP 695 `type` statements, which are not parsed
+  // when the checker is told to target 3.11. Targeting 3.11 silently degrades
+  // numpy's ArrayLike to Unknown and buries the real diagnostics under ~750
+  // spurious ones. The package still runs on 3.11 (see requires-python) — this
+  // only sets the syntax level for type checking.
+  "pythonVersion": "3.12",
+
+  // Resolve imports against the project virtualenv rather than whatever
+  // interpreter happens to be on PATH, so `pyright` behaves identically in CI,
+  // in a terminal and in the editor.
+  "venvPath": ".",
+  "venv": ".venv",
+
+  // Partial stubs for scikit-learn and onnxruntime, neither of which ships
+  // py.typed. Scope and maintenance policy are documented in stubs/README.md.
+  "stubPath": "stubs",
+
   "typeCheckingMode": "strict",
   "include": [
     "src",

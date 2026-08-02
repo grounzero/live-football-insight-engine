@@ -1,4 +1,4 @@
-# ADR 0001 — Predict penalty-area entries, not shots
+# ADR 0001: Predict penalty-area entries, not shots
 
 **Status:** accepted · **Date:** 2026-08-01
 

@@ -43,14 +43,18 @@ dependencies = [
 [project.optional-dependencies]
 tracking = ["mlflow>=2.16,<4"]
 dev = [
-    "pytest>=8.3,<9",
+    # >=9.0.3: 8.x is affected by PYSEC-2026-1845, and the previous `<9` cap
+    # made the fixed release uninstallable.
+    "pytest>=9.0.3,<10",
     "pytest-cov>=5.0",
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
     "mypy>=1.11",
+    "pyright>=1.1.390",
     "types-pyyaml",
     "pandas-stubs",
     "pip-audit>=2.7",
+    "build>=1.2,<2",
 ]
 
 [project.scripts]
@@ -65,6 +69,16 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 football_insights = ["py.typed"]
+# The built demo. Without these the service still starts but `_mount_demo`
+# finds no index.html and quietly serves the API only, so an installed wheel
+# would never show the demo the README points at. Asset filenames are
+# content-hashed by vite and change on every build, hence the glob.
+#
+# `static/*.svg` covers vite's `public/` passthrough, which lands at the root of
+# the output rather than under `assets/`: the favicon is content-addressed by
+# neither name nor hash, so without this line the wheel ships a page that asks
+# for an icon it does not contain.
+"football_insights.serving" = ["static/index.html", "static/assets/*", "static/*.svg"]
 
 # ---------------------------------------------------------------- ruff
 [tool.ruff]
@@ -121,6 +135,9 @@ warn_unreachable = true
 disallow_any_generics = true
 show_error_codes = true
 files = ["src", "tests"]
+# Local partial stubs for scikit-learn and onnxruntime, shared with pyright via
+# `stubPath` in pyrightconfig.json. See stubs/README.md for scope.
+mypy_path = "stubs"
 
 [[tool.mypy.overrides]]
 module = ["sklearn.*", "onnxruntime.*", "onnx.*", "mlflow.*", "sse_starlette.*", "joblib.*"]

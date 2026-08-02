@@ -30,22 +30,44 @@ jobs:
           python-version: ${{ matrix.python }}
           cache: pip
 
+      # Installed into .venv rather than the system interpreter so that
+      # pyrightconfig.json's venvPath resolves to the same place here as it does
+      # locally and in the editor. Without it pyright silently fails to resolve
+      # numpy, torch and friends, and reports thousands of phantom errors.
       - name: Install
         run: |
-          python -m pip install --upgrade pip
-          pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install --extra-index-url https://download.pytorch.org/whl/cpu -e ".[dev]"
 
       - name: Lint
-        run: ruff check src tests
+        run: .venv/bin/ruff check src tests
 
       - name: Format check
-        run: ruff format --check src tests
+        run: .venv/bin/ruff format --check src tests
 
-      - name: Type check
-        run: mypy
+      - name: Type check (mypy)
+        run: .venv/bin/mypy
+
+      # Once only. pyrightconfig.json pins pythonVersion, so every matrix leg
+      # would analyse identically; running it per version costs time and proves
+      # nothing extra.
+      - name: Type check (pyright, strict)
+        if: matrix.python == '3.13'
+        run: .venv/bin/pyright
+
+      # requires-python is >=3.11, so the floor has to be exercised as a
+      # *runtime*, not just as a checkout the linters happen to parse. Imports
+      # and the console script catch packaging and entry-point breakage that
+      # the test suite can miss when it runs from the source tree.
+      - name: Runtime import and CLI smoke
+        run: |
+          .venv/bin/python -c "import football_insights, football_insights.cli"
+          .venv/bin/python -c "import football_insights.data"
+          .venv/bin/football-insights --help > /dev/null
 
       - name: Tests
-        run: pytest -q -m "not requires_data" --cov --cov-report=term-missing
+        run: .venv/bin/pytest -q -m "not requires_data" --cov --cov-report=term-missing
 
   smoke:
     name: Inference and ONNX parity smoke test
@@ -131,9 +153,13 @@ jobs:
 
       - name: Audit dependencies
         # Advisory: a new CVE in a transitive dependency should surface without
-        # blocking an unrelated pull request.
+        # blocking an unrelated pull request. Expressed with continue-on-error
+        # rather than `|| true` so the step still reports its real result.
         continue-on-error: true
-        run: pip-audit --progress-spinner off
+        # --skip-editable for the same reason as `make audit`: this project is
+        # not on PyPI, so auditing the editable install only reports itself as
+        # missing and says nothing about our dependencies.
+        run: pip-audit --progress-spinner off --skip-editable
 
   demo:
     name: Build the demo
@@ -148,6 +174,11 @@ jobs:
       - run: npm install
         working-directory: demo
       - run: npm run build
+        working-directory: demo
+      # Structure only — that the live region, the scrolling body and the
+      # confidence panel's slots survive a change. Geometry is not assertable
+      # from markup and is measured in a browser by hand.
+      - run: npm run test:ssr
         working-directory: demo
 
   container:

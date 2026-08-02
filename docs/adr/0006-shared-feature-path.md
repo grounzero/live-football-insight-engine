@@ -1,11 +1,11 @@
-# ADR 0006 — One feature implementation for training and serving
+# ADR 0006: One feature implementation for training and serving
 
 **Status:** accepted · **Date:** 2026-08-01
 
 ## Context
 
-Two implementations of "the same" features — one vectorised for training, one incremental for
-serving — is the classic source of train/serve skew: the model evaluates well and quietly degrades
+Two implementations of "the same" features, one vectorised for training and one incremental for
+serving, is the classic source of train/serve skew: the model evaluates well and quietly degrades
 in production.
 
 ## Decision
@@ -19,7 +19,7 @@ details make that possible:
 2. **Velocity warm-up.** The rolling buffer holds `observation + span` frames and discards the
    leading `span` rows after computing features, so every retained row has real history rather than
    edge padding. The offline slice does the same.
-3. **Attacking team fixed per window.** The live buffer has one attacking team — the one in
+3. **Attacking team fixed per window.** The live buffer has one attacking team, the one in
    possession at the prediction instant. So offline features are computed per
    `(period, attacking team)` over the whole period, and a window is sliced from the matrix of the
    team in possession at its final frame.

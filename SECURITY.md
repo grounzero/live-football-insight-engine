@@ -2,7 +2,7 @@
 
 ## Scope
 
-A portfolio project that replays public sample data locally. It has no authentication, no
+A project that replays public sample data locally. It has no authentication, no
 persistence and no multi-tenancy, and is not intended for public deployment as-is.
 
 ## Reporting

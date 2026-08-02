@@ -60,6 +60,14 @@ class EngineResult:
     #: Set when the frame could not be processed at all, e.g. it arrived out of
     #: order. Distinct from a suppression, which implies a scored window.
     rejection: str | None = None
+    #: Team in possession, and the direction it attacks in canonical
+    #: coordinates (positive is toward increasing x). Resolved here because the
+    #: orientation table belongs to the engine: a presentation layer consulting
+    #: it would duplicate the half-swap this class already applies to the ball.
+    #: Both stay ``None`` when possession is unknown, which is a different
+    #: statement from "attacking left" and must not be flattened into one.
+    attacking_team: str | None = None
+    attacking_sign: float | None = None
 
 
 class _ContextTracker:
@@ -317,7 +325,13 @@ class InsightEngine:
             outcome = self._policy.review(prediction, None, frame.time_s)
             self._record(outcome)
             self._metrics.e2e_latency.observe(time.perf_counter() - started)
-            return EngineResult(prediction, outcome, frame_accepted=True)
+            return EngineResult(
+                prediction,
+                outcome,
+                frame_accepted=True,
+                attacking_team=attacking.value,
+                attacking_sign=direction,
+            )
 
         if self._predictor is None or not self._schema_ok:
             reason = (
@@ -328,7 +342,16 @@ class InsightEngine:
             outcome = self._policy.suppress_unavailable(frame.time_s, reason)
             self._record(outcome)
             self._metrics.e2e_latency.observe(time.perf_counter() - started)
-            return EngineResult(None, outcome, frame_accepted=True)
+            # No prediction, but the direction is still known. This is why these
+            # fields live on the result rather than on `Prediction`: a viewer can
+            # be shown which way play is running even while the model is down.
+            return EngineResult(
+                None,
+                outcome,
+                frame_accepted=True,
+                attacking_team=attacking.value,
+                attacking_sign=direction,
+            )
 
         window = window_features_from_buffer(
             self._buffer,
@@ -367,7 +390,13 @@ class InsightEngine:
         outcome = self._policy.review(prediction, window, frame.time_s)
         self._record(outcome, probability)
         self._metrics.e2e_latency.observe(time.perf_counter() - started)
-        return EngineResult(prediction, outcome, frame_accepted=True)
+        return EngineResult(
+            prediction,
+            outcome,
+            frame_accepted=True,
+            attacking_team=attacking.value,
+            attacking_sign=direction,
+        )
 
     def _provisional_attacker(self, frame: Frame) -> Team | None:
         """Team in possession at this frame, from the causal view only."""

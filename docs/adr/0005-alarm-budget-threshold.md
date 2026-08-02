@@ -1,11 +1,11 @@
-# ADR 0005 — Set the operating point from a false-alarm budget
+# ADR 0005: Set the operating point from a false-alarm budget
 
 **Status:** accepted · **Date:** 2026-08-01 · **Supersedes:** window-precision targeting
 
 ## Context
 
 The first threshold rule picked the lowest threshold reaching 0.30 window precision. Measured on
-the training matches, that produced roughly **140 false alarms per 90 minutes** — about one every
+the training matches, that produced roughly **140 false alarms per 90 minutes**, about one every
 forty seconds. Every model looked acceptable per window and unusable as a product.
 
 Window precision optimises the wrong thing. Windows are not what a viewer experiences.

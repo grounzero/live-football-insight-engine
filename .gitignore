@@ -1,13 +1,20 @@
 # Raw and processed match data is never committed.
 # Metrica sample data carries no formal licence (see docs/data_card.md) and is
 # ~180 MB; `make data` downloads it into data/ at setup time.
-data/
-!data/.gitkeep
+#
+# The leading slash anchors these to the repository root, and it is load-bearing:
+# an unanchored `data/` also matches src/football_insights/data/, which silently
+# kept the entire data-ingestion package out of the repository.
+/data/
+!/data/.gitkeep
 
 # Generated artifacts: models, reports, benchmarks, experiment tracking.
-artifacts/
-!artifacts/.gitkeep
-mlruns/
+/artifacts/
+!/artifacts/.gitkeep
+# Anchored for the same reason as /data/ above: MLflow's default tracking store
+# is artifacts/mlruns, so a root rule loses nothing, and an unanchored one would
+# match any nested directory of that name.
+/mlruns/
 *.onnx
 *.pt
 *.pkl
@@ -25,16 +32,38 @@ dist/
 .ruff_cache/
 .pytest_cache/
 .coverage
+# Per-process files written when coverage runs in parallel mode, before combine.
+.coverage.*
 htmlcov/
 coverage.xml
+
+# Local environment overrides. Nothing here reads a .env file today (settings
+# come from FI_-prefixed variables and a YAML file), but python-dotenv arrives
+# with uvicorn[standard], so one is easy to create and easy to commit.
+.env
+.env.*
 
 # Node / demo
 node_modules/
 demo/dist/
 demo/.vite/
+# Built by `npm run test:ssr` so node --test can load JSX components.
+demo/.ssr-test/
 
 # OS / editor
 .DS_Store
 .idea/
 .vscode/
 *.swp
+*.swo
+
+# Machine-local Claude Code settings. The shared `.claude/settings.json` is not
+# ignored: only the `.local` file, which records one developer's permissions.
+.claude/settings.local.json
+
+/src/football_insights/serving/static/assets/
+/src/football_insights/serving/static/index.html
+
+# Generated Vite frontend output
+/src/football_insights/serving/static/*
+!/src/football_insights/serving/static/.gitkeep

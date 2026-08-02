@@ -36,7 +36,7 @@ from football_insights.models.evaluate import (
 )
 from football_insights.models.heuristic import HeuristicPredictor
 from football_insights.models.temporal import TemporalPredictor, train_temporal
-from football_insights.types import JsonDict
+from football_insights.types import Float32Array, FloatArray, IntArray, JsonDict, LabelArray
 
 if TYPE_CHECKING:
     from football_insights.config import Settings
@@ -56,13 +56,20 @@ class MatchData:
     """A prepared match loaded into memory."""
 
     match_id: str
-    windows: np.ndarray
-    labels: np.ndarray
-    times_s: np.ndarray
-    teams: np.ndarray
-    cluster_id: np.ndarray
-    episode_times: np.ndarray
-    episode_teams: np.ndarray
+    #: ``(n, sequence_length, n_features)`` in feature-spec order.
+    windows: Float32Array
+    #: ``(n,)`` binary labels aligned with ``windows``.
+    labels: LabelArray
+    #: ``(n,)`` window end times in seconds from kick-off.
+    times_s: FloatArray
+    #: ``(n,)`` attacking team per window, as ``Team`` integer codes.
+    teams: IntArray
+    #: ``(n,)`` episode identifier per window; ``-1`` where ungrouped.
+    cluster_id: IntArray
+    #: ``(n_episodes,)`` episode start times in seconds.
+    episode_times: FloatArray
+    #: ``(n_episodes,)`` attacking team per episode.
+    episode_teams: IntArray
     minutes: float
 
     def __len__(self) -> int:
@@ -75,7 +82,7 @@ class FoldResult:
     """Results for one held-out match."""
 
     held_out: str
-    results: dict[str, EvaluationResult] = field(default_factory=dict)
+    results: dict[str, EvaluationResult] = field(default_factory=dict[str, EvaluationResult])
 
     def to_dict(self) -> JsonDict:
         """Serialisable form."""
@@ -161,7 +168,10 @@ def time_split_with_embargo(
     Returns:
         ``(train windows, train labels, validation windows, validation labels)``.
     """
-    train_w, train_y, val_w, val_y = [], [], [], []
+    train_w: list[Float32Array] = []
+    train_y: list[LabelArray] = []
+    val_w: list[Float32Array] = []
+    val_y: list[LabelArray] = []
     for match in matches:
         if len(match) == 0:
             continue

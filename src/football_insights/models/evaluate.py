@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 from sklearn.metrics import average_precision_score, brier_score_loss
 
-from football_insights.types import JsonDict
+from football_insights.types import BoolArray, FloatArray, JsonDict, LabelArray
 
 if TYPE_CHECKING:
     from football_insights.config import EpisodeSettings
@@ -96,8 +96,8 @@ class EvaluationResult:
     threshold: float
     window: WindowMetrics
     episode: EpisodeMetrics
-    calibration: list[dict[str, float]] = field(default_factory=list)
-    intervals: dict[str, list[float]] = field(default_factory=dict)
+    calibration: list[dict[str, float]] = field(default_factory=list[dict[str, float]])
+    intervals: dict[str, list[float]] = field(default_factory=dict[str, list[float]])
     notes: str = ""
 
     def to_dict(self) -> JsonDict:
@@ -113,7 +113,7 @@ class EvaluationResult:
         }
 
 
-def window_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> WindowMetrics:
+def window_metrics(y_true: LabelArray, y_prob: FloatArray, threshold: float) -> WindowMetrics:
     """Compute window-level metrics.
 
     Args:
@@ -126,10 +126,15 @@ def window_metrics(y_true: np.ndarray, y_prob: np.ndarray, threshold: float) -> 
         honest reading: a model that never predicts positive has no precision to
         report, and treating it as 1.0 would flatter it.
     """
-    predicted = y_prob >= threshold
-    tp = int(np.sum(predicted & (y_true == 1)))
-    fp = int(np.sum(predicted & (y_true == 0)))
-    fn = int(np.sum(~predicted & (y_true == 1)))
+    # numpy types elementwise `==` as Any (it also has to cover object arrays),
+    # which propagates into every count below. The annotations pin it back to
+    # what it actually is; the comparisons themselves are unchanged.
+    predicted: BoolArray = y_prob >= threshold
+    positive: BoolArray = y_true == 1
+    negative: BoolArray = y_true == 0
+    tp = int(np.sum(predicted & positive))
+    fp = int(np.sum(predicted & negative))
+    fn = int(np.sum(~predicted & positive))
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = 2 * precision * recall / (precision + recall) if (precision + recall) else 0.0

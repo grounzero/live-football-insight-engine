@@ -1,4 +1,4 @@
-# ADR 0004 — Score episodes, and bootstrap over possessions
+# ADR 0004: Score episodes, and bootstrap over possessions
 
 **Status:** accepted · **Date:** 2026-08-01
 
@@ -16,7 +16,8 @@ metric and, worse, every confidence interval.
   one-to-one.
 - Confidence intervals use a **cluster bootstrap over possession sequences**, never over windows.
 - Alarms firing before the lead-up interval are reported separately as *early*, not silently
-  counted as false alarms — a twelve-second warning is outside the contract but not football-wrong.
+  counted as false alarms, since a twelve-second warning is outside the contract but not
+  football-wrong.
 
 ## Consequences
 
