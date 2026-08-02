@@ -312,6 +312,34 @@ class TestReplayRestart:
             out.append(json.loads(message.data))
         return out
 
+    @classmethod
+    async def _drain_rollups(
+        cls, queue: asyncio.Queue[StreamMessage], count: int, limit: int = 4000
+    ) -> list[JsonDict]:
+        """Drain until ``count`` editorial rollups have arrived.
+
+        Counted in rollups rather than in messages, because a rollup is what
+        these assertions actually read and it is the only quantity here tied to
+        frames *scored* rather than frames *shown*. Visual frames are published
+        on a wall clock now, so at 50x a fixed message count is mostly a
+        measurement of how long the test took to get scheduled — the same window
+        that used to hold five hundred frames holds about sixteen.
+
+        Returns:
+            Every message drained, ending on the ``count``-th rollup.
+        """
+        out: list[JsonDict] = []
+        seen = 0
+        while len(out) < limit:
+            message = await asyncio.wait_for(queue.get(), timeout=10.0)
+            payload = json.loads(message.data)
+            out.append(payload)
+            if payload["type"] == "suppression":
+                seen += 1
+                if seen >= count:
+                    return out
+        pytest.fail(f"only {seen} of {count} rollups in {limit} messages")
+
     @staticmethod
     async def _drain_to_restart(
         queue: asyncio.Queue[StreamMessage], limit: int = 2000
@@ -358,12 +386,12 @@ class TestReplayRestart:
         queue = state.subscribe()
         state.ensure_replay_task()
         try:
-            before = await self._drain(queue, 120)
+            before = await self._drain_rollups(queue, 3)
             player.reset()
             state.request_restart()
             # Everything queued before the restart, ending at the marker itself.
             through_restart = await self._drain_to_restart(queue)
-            after = await self._drain(queue, 120)
+            after = await self._drain_rollups(queue, 3)
         finally:
             player.stop()
 

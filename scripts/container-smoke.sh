@@ -171,8 +171,76 @@ if "payload" not in message:
 
 print(f"  first event: {message['type']}")
 PY
-rm -f "${sse_out}"
 pass "the stream emits well-formed, parseable events"
+
+# The frames a browser has to buffer and interpolate. Checked here rather than
+# only in the unit suite because these fields cross a process boundary, and the
+# failure they guard against — a client that cannot order samples or tell one
+# lap from the next — looks like a rendering bug, not a schema one.
+python3 - "${sse_out}" <<'PY' || { rm -f "${sse_out}"; fail "visual frames are missing their source metadata"; }
+import json, sys
+
+REQUIRED = {"match_time_s", "frame", "lap", "fixture", "speed", "period"}
+frames = []
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        if not line.startswith("data:"):
+            continue
+        try:
+            message = json.loads(line.split(":", 1)[1].strip())
+        except json.JSONDecodeError:
+            continue
+        if message.get("type") == "frame":
+            frames.append(message["payload"])
+
+if not frames:
+    raise SystemExit("the stream carried no visual frames at all")
+
+missing = REQUIRED - set(frames[0])
+if missing:
+    raise SystemExit(f"visual frames are missing {sorted(missing)}")
+
+times = [f["match_time_s"] for f in frames]
+if times != sorted(times):
+    raise SystemExit("source timestamps arrived out of order")
+
+ids = [f["frame"] for f in frames]
+if len(set(ids)) != len(ids):
+    raise SystemExit("the same source frame was published more than once")
+
+print(f"  {len(frames)} visual frames, source time {times[0]:.2f}s -> {times[-1]:.2f}s")
+print(f"  fixture {frames[-1]['fixture']!r} at {frames[-1]['speed']}x, lap {frames[-1]['lap']}")
+PY
+pass "visual frames carry source time, frame id, lap, fixture and speed"
+
+# A broad band, not a target. The point is to catch the class of bug this
+# replaced — publication decimating source frames, so the wire rate multiplied
+# by the replay speed and reached a hundred a second — not to assert a cadence
+# that would make CI fail on a loaded runner. The lower bound catches the
+# opposite mistake of a limiter that never lets go.
+python3 - "${sse_out}" "${SSE_TIMEOUT_S}" <<'PY' || { rm -f "${sse_out}"; fail "the visual cadence is outside the 5-40 Hz band"; }
+import json, sys
+
+window = float(sys.argv[2])
+frames = 0
+with open(sys.argv[1], encoding="utf-8") as handle:
+    for line in handle:
+        if not line.startswith("data:"):
+            continue
+        try:
+            message = json.loads(line.split(":", 1)[1].strip())
+        except json.JSONDecodeError:
+            continue
+        frames += message.get("type") == "frame"
+
+# curl was cut off by --max-time, so the capture is the whole window.
+rate = frames / window
+print(f"  {frames} frames in {window:.0f}s = {rate:.1f} Hz")
+if not 5.0 <= rate <= 40.0:
+    raise SystemExit(f"{rate:.1f} Hz is outside the 5-40 Hz band")
+PY
+rm -f "${sse_out}"
+pass "the visual cadence is within a sane band"
 
 step "the image itself"
 docker run --rm "${IMAGE}" python -c "

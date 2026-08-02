@@ -101,6 +101,17 @@ class ReplayPlayer:
         return len(self._emitted)
 
     @property
+    def speed(self) -> float:
+        """Current replay rate, as a multiple of real time.
+
+        Exposed on its own rather than read from :meth:`status` because the
+        publish path consults it once per frame — two hundred times a second at
+        the demo's pace — and ``status`` builds a dataclass and serialises the
+        fault summary into a fresh dict every time it is called.
+        """
+        return self._speed
+
+    @property
     def laps(self) -> int:
         """How many times a looping replay has wrapped back to the first frame.
 

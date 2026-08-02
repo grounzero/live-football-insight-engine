@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
 
@@ -21,6 +23,8 @@ from football_insights.serving.messages import StreamMessageType, stream_message
 from football_insights.types import JsonDict
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from football_insights.domain import Frame
     from football_insights.insight.types import EditorialOutcome, Insight
     from football_insights.serving.engine import EngineResult, InsightEngine
@@ -29,13 +33,23 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger("football_insights.serving")
 
 #: Tracking rate the replay path assumes when turning frame counts into match
-#: time. Both the publish throttle and the suppression rollup derive from it, so
-#: the two cadences cannot drift apart if either is retuned.
+#: time. The suppression rollup derives from it, so a retune moves both together.
 SOURCE_FRAME_HZ: Final = 25.0
 
-#: Frames are sent to the browser at this rate regardless of tracking rate;
-#: 25 Hz of JSON per client is wasteful and invisible to the eye.
-FRAME_PUBLISH_HZ: Final = 12.5
+#: Visual frames per second of *wall clock*, for every subscriber and at every
+#: replay speed.
+#:
+#: The distinction matters more than it looks. This used to be expressed as a
+#: fraction of the source rate and applied as ``counter % publish_every``, which
+#: is a ratio of *source frames* rather than a rate: at the hosted demo's pace it
+#: multiplied out to a hundred messages a second, which no display can show and
+#: no browser should be asked to parse. A schedule measured against the wall
+#: clock is the same number at 1x and at 8x.
+#:
+#: 20 Hz rather than 60: the browser interpolates between these samples on its
+#: own refresh, so this only has to be dense enough to describe the motion, and
+#: every message above that is bandwidth and main-thread work nobody can see.
+VISUAL_PUBLISH_HZ: Final = 20.0
 
 #: Editorial review runs on every processed frame, so one message per decision
 #: would be 25 a second whose individual values tell a reader nothing. The frame
@@ -105,6 +119,88 @@ class SuppressionRollup:
         return payload
 
 
+class VisualRateLimiter:
+    """A monotonic wall-clock schedule for visual frames.
+
+    Answers one question — may a picture go out now? — against a deadline that
+    advances on its own clock rather than on the frames arriving. That is the
+    whole point: the caller is iterating a replay whose rate is a *multiple* of
+    real time, so anything derived from the frames themselves inherits that
+    multiple.
+
+    Missed deadlines are skipped, never repaid. A producer that stalls for
+    300 ms has six overdue slots when it wakes; publishing six frames back to
+    back would put five stale pictures on the wire ahead of the only one anybody
+    can still use, and the browser would show the burst as a snap. Advancing the
+    deadline past all six and sending the newest frame once is both cheaper and
+    the only version that looks right.
+
+    Args:
+        hz: Visual frames per second of wall clock.
+        clock: Monotonic time source, injectable so tests can drive the schedule
+            without sleeping.
+    """
+
+    __slots__ = ("_clock", "_deadline", "_period", "_skipped")
+
+    def __init__(
+        self, hz: float = VISUAL_PUBLISH_HZ, clock: Callable[[], float] | None = None
+    ) -> None:
+        """Start unarmed, so the first frame offered is always published."""
+        self._period = 1.0 / hz
+        self._clock = clock or time.monotonic
+        self._deadline: float | None = None
+        self._skipped = 0
+
+    @property
+    def skipped_deadlines(self) -> int:
+        """Deadlines passed over because the producer was late.
+
+        Reported rather than merely counted: a rising number is the signal that
+        the replay is not keeping its own schedule, which is a different fault
+        from the network being slow and needs a different fix.
+        """
+        return self._skipped
+
+    def reset(self) -> None:
+        """Forget the schedule, so the next frame offered publishes immediately.
+
+        Used at every barrier. A restart, a lap wrap or a period change must put
+        a picture on the wire at once — a client that has just cleared its
+        interpolation buffer has nothing to draw until it does — and making it
+        wait out a deadline set by the previous fixture would be an arbitrary
+        blank frame at the one moment the viewer is most likely to notice.
+        """
+        self._deadline = None
+
+    def due(self, *, force: bool = False) -> bool:
+        """Whether a visual frame may be published now.
+
+        Args:
+            force: Publish regardless, and re-anchor the schedule from now. For
+                barriers the client must see immediately — a period change, say —
+                where simply returning True would leave the old deadline standing
+                and put a second picture out microseconds later.
+
+        Returns:
+            True at most once per period. The caller passes the newest frame it
+            has; frames offered between deadlines are dropped for display only
+            and still reach inference.
+        """
+        now = self._clock()
+        if force or self._deadline is None:
+            self._deadline = now + self._period
+            return True
+        if now < self._deadline:
+            return False
+        # How many whole periods have elapsed since the deadline we just missed.
+        # `+ 1` because passing the deadline at all consumes the slot it names.
+        missed = math.floor((now - self._deadline) / self._period) + 1
+        self._skipped += missed - 1
+        self._deadline += missed * self._period
+        return True
+
+
 def round_positions(xy: np.ndarray) -> list[list[float] | None]:
     """Round coordinates for transport, replacing absent players with ``None``."""
     out: list[list[float] | None] = []
@@ -116,8 +212,34 @@ def round_positions(xy: np.ndarray) -> list[list[float] | None]:
     return out
 
 
-def frame_payload(frame: Frame, result: EngineResult, suppression: str | None) -> JsonDict:
-    """Build the browser-facing message describing one frame."""
+@dataclass(frozen=True, slots=True)
+class VisualContext:
+    """Which replay a visual frame belongs to, and how fast it is running.
+
+    Carried on every frame rather than announced once, because the browser
+    interpolates between frames and must never interpolate across a boundary.
+    Inferring one from a separate control message would make that correctness
+    depend on message ordering across two cadences; putting it in the frame
+    makes each frame self-describing, and a client that missed the barrier still
+    cannot blend two fixtures together.
+    """
+
+    match_id: str
+    lap: int
+    speed: float
+
+
+def frame_payload(
+    frame: Frame,
+    result: EngineResult,
+    suppression: str | None,
+    context: VisualContext,
+) -> JsonDict:
+    """Build the browser-facing message describing one frame.
+
+    Every field added here is additive: a client built against the older schema
+    ignores what it does not recognise and keeps working.
+    """
     probability = (
         result.prediction.probability
         if result.prediction and result.prediction.window_valid
@@ -126,6 +248,14 @@ def frame_payload(frame: Frame, result: EngineResult, suppression: str | None) -
     return {
         "period": frame.period,
         "match_time_s": round(frame.time_s, 2),
+        # Source identity and pacing, for the client's playout buffer. `frame`
+        # orders samples that share a timestamp, `lap` and `fixture` bound
+        # interpolation, and `speed` converts a wall-clock playout delay into the
+        # match seconds the render clock actually advances in.
+        "frame": int(frame.frame),
+        "lap": context.lap,
+        "fixture": context.match_id,
+        "speed": context.speed,
         "home": round_positions(frame.home_xy),
         "away": round_positions(frame.away_xy),
         "ball": round_positions(frame.ball_xy[None, :])[0],
@@ -163,7 +293,7 @@ def apply_restart(state: AppState, engine: InsightEngine) -> None:
     """
     engine.reset()
     state.recent_insights.clear()
-    state.publish(stream_message(StreamMessageType.RESTART, {}), critical=True)
+    state.publish_barrier(stream_message(StreamMessageType.RESTART, {}))
     LOGGER.info("replay restarted")
 
 
@@ -174,9 +304,8 @@ def announce_match(state: AppState, match_id: str, *, loading: bool) -> None:
     the first message sits watching a frozen pitch with no explanation, and one
     that misses the second never stops waiting.
     """
-    state.publish(
-        stream_message(StreamMessageType.MATCH, {"match_id": match_id, "loading": loading}),
-        critical=True,
+    state.announce(
+        stream_message(StreamMessageType.MATCH, {"match_id": match_id, "loading": loading})
     )
 
 
@@ -185,6 +314,7 @@ def _publish_results(
     frame: Frame,
     result: EngineResult,
     rollup: SuppressionRollup,
+    context: VisualContext,
     *,
     publish_frame: bool,
 ) -> None:
@@ -192,8 +322,12 @@ def _publish_results(
 
     Three separate cadences, which is why they are here rather than inline in
     the loop: an insight goes out the moment it is emitted, the editorial rollup
-    once per second of match time, and the frame itself at half the rate it was
-    scored at.
+    once per second of match time, and the picture on a wall-clock schedule that
+    is deliberately unrelated to either.
+
+    Only the picture is rate-limited. An insight is the product and a rollup is
+    an exact total over frames that were all reviewed; dropping either to save
+    bandwidth would turn a measurement into a sample presented as a total.
     """
     reason = rollup.record(result.outcome)
 
@@ -204,30 +338,43 @@ def _publish_results(
         state.publish(stream_message(StreamMessageType.SUPPRESSION, rollup.drain()))
 
     if publish_frame:
-        state.publish(stream_message(StreamMessageType.FRAME, frame_payload(frame, result, reason)))
+        state.publish_frame(
+            stream_message(StreamMessageType.FRAME, frame_payload(frame, result, reason, context))
+        )
 
 
-async def run_replay(state: AppState) -> None:
-    """Drive the replay through the engine and publish results."""
+async def run_replay(state: AppState, clock: Callable[[], float] | None = None) -> None:
+    """Drive the replay through the engine and publish results.
+
+    Args:
+        state: Shared application state; supplies the player, the engine and the
+            subscriber set.
+        clock: Monotonic time source for the visual publish schedule. Injectable
+            so a test can assert the cadence without running in real time.
+    """
     player = state.player
     engine = state.engine
     if player is None or engine is None:
         return
+    status = player.status()
     cid = new_correlation_id()
     LOGGER.info(
         "replay started",
         extra={
-            "match_id": player.status().match_id,
-            "fault_profile": player.status().profile,
-            "seed": player.status().seed,
-            "speed": player.status().speed,
+            "match_id": status.match_id,
+            "fault_profile": status.profile,
+            "seed": status.seed,
+            "speed": status.speed,
+            "visual_publish_hz": VISUAL_PUBLISH_HZ,
             "correlation_id": cid,
         },
     )
-    publish_every = max(1, round(SOURCE_FRAME_HZ / FRAME_PUBLISH_HZ))
+    visual = VisualRateLimiter(clock=clock)
     rollup = SuppressionRollup()
     counter = 0
     laps = player.laps
+    match_id = status.match_id
+    period: int | None = None
     try:
         async for emitted in player.stream(loop=state.settings.replay.loop):
             if state.take_restart():
@@ -241,6 +388,11 @@ async def run_replay(state: AppState) -> None:
                 rollup = SuppressionRollup()
                 counter = 0
                 laps = player.laps
+                # A barrier the client answers by clearing its interpolation
+                # buffer, so it has nothing to draw until the next picture. The
+                # schedule is dropped rather than honoured so that picture is the
+                # very next frame.
+                visual.reset()
                 continue
 
             if player.laps != laps:
@@ -255,6 +407,7 @@ async def run_replay(state: AppState) -> None:
                 apply_restart(state, engine)
                 rollup = SuppressionRollup()
                 counter = 0
+                visual.reset()
 
             if state.should_stop_unwatched():
                 LOGGER.info(
@@ -264,12 +417,22 @@ async def run_replay(state: AppState) -> None:
                 return
 
             counter += 1
+            frame = emitted.frame
+
+            # A period change is a barrier for the same reason a lap is: the
+            # teams have swapped ends, so interpolating from the last frame of
+            # one half into the first of the next would walk twenty-two players
+            # across the halfway line over 50 ms.
+            barrier = period is not None and frame.period != period
+            period = frame.period
+
             _publish_results(
                 state,
-                emitted.frame,
-                engine.process(emitted.frame),
+                frame,
+                engine.process(frame),
                 rollup,
-                publish_frame=counter % publish_every == 0,
+                VisualContext(match_id=match_id, lap=laps, speed=player.speed),
+                publish_frame=visual.due(force=barrier),
             )
     except asyncio.CancelledError:  # pragma: no cover - shutdown
         raise

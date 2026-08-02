@@ -44,6 +44,16 @@ class AppState:
     _subscribers: set[_Subscriber] = field(default_factory=set[_Subscriber])
     _task: asyncio.Task[None] | None = None
     _restart: bool = False
+    #: What a client joining a replay already in progress is sent before
+    #: anything else: the match announcement it missed, then the most recent
+    #: picture of that match. Either may be absent — the public demo announces
+    #: nothing at startup, because it never changes match.
+    #:
+    #: One field holding both rather than two fields, and always rebound whole.
+    #: The pair has to be consistent, and there is no lock here: a subscriber
+    #: arriving between two assignments would be seeded with an announcement
+    #: from one fixture and a picture from another.
+    _snapshot: tuple[StreamMessage | None, StreamMessage | None] = (None, None)
     #: Held for the whole of a match switch. Two switches at once, or a switch
     #: racing a restart, would interleave a cancel against a half-installed
     #: player; nothing else in this object serialises them.
@@ -99,8 +109,22 @@ class AppState:
         return self._task is not None and not self._task.done()
 
     def subscribe(self) -> _Subscriber:
-        """Register a new SSE subscriber."""
+        """Register a new SSE subscriber, seeded with the current snapshot.
+
+        A shared replay is always mid-match by the time anyone arrives. Without
+        this the visitor watches an empty pitch until the next scheduled picture
+        and, worse, has no idea which fixture or lap the frames belong to when
+        they do start — the match announcement was published before they
+        connected and is not repeated.
+
+        Seeded here, synchronously, rather than by asking the replay loop to
+        re-announce: the loop is between frames at an arbitrary point and would
+        have to be interrupted, and the messages are already serialised.
+        """
         queue: _Subscriber = asyncio.Queue(maxsize=256)
+        for message in self._snapshot:
+            if message is not None:
+                queue.put_nowait(message)
         self._subscribers.add(queue)
         return queue
 
@@ -182,6 +206,38 @@ class AppState:
         with contextlib.suppress(asyncio.CancelledError):
             await task
         self._suppress_end = False
+
+    def announce(self, message: StreamMessage) -> None:
+        """Publish a match announcement and make it the head of the snapshot.
+
+        The frame is dropped rather than kept alongside the new announcement.
+        It describes the *previous* fixture, and a visitor seeded with a match
+        message from one replay and a picture from another would draw the old
+        positions under the new name — then interpolate from them into the first
+        real frame, walking every player across the pitch.
+        """
+        self._snapshot = (message, None)
+        self.publish(message, critical=True)
+
+    def publish_barrier(self, message: StreamMessage) -> None:
+        """Publish a critical barrier and discard the snapshot's stale picture.
+
+        After a rewind or a lap wrap the retained frame belongs to a replay that
+        no longer exists. Seeding a new subscriber with it would show them the
+        end of the last lap as though it were the current position, and their
+        interpolator would then blend that into the first frame of the new one.
+        """
+        self._snapshot = (self._snapshot[0], None)
+        self.publish(message, critical=True)
+
+    def publish_frame(self, message: StreamMessage) -> None:
+        """Publish a visual frame and keep it as the snapshot's current picture.
+
+        Replaces the picture without touching the announcement, so the pair
+        always describes one fixture.
+        """
+        self._snapshot = (self._snapshot[0], message)
+        self.publish(message)
 
     def publish(self, message: StreamMessage, *, critical: bool = False) -> None:
         """Fan out a message, dropping it for any subscriber that has fallen behind.
