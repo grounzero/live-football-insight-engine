@@ -19,7 +19,7 @@ import { renderToStaticMarkup } from 'react-dom/server'
 
 import App from '../src/App.jsx'
 import { Confidence, Header, RuntimeStatus } from '../src/panels.jsx'
-import { Transport } from '../src/transport.jsx'
+import { ReadOnlyNotice, Transport } from '../src/transport.jsx'
 import { InsightList } from '../src/insights.jsx'
 import { PipelinePanel } from '../src/pipeline.jsx'
 import { keyFor } from '../src/format.js'
@@ -263,6 +263,25 @@ test('the pipeline panel says what these stages cost before anyone presses one',
 
   assert.match(text, /takes minutes/)
   assert.match(text, /data\/ and artifacts\//)
+})
+
+test('the public notice states the replay speed and why the controls are gone', () => {
+  const text = visibleText(render(<ReadOnlyNotice speed={4} />))
+
+  // The rate matters to a viewer: at four times match pace the football looks
+  // impossibly quick, and someone judging the motion without knowing that is
+  // judging the wrong thing.
+  assert.match(text, /4× match pace/)
+  assert.match(text, /every viewer shares one replay/)
+  // A shared replay is read-only on purpose; the page must not imply otherwise.
+  assert.match(text, /controls are disabled/)
+})
+
+test('the public notice claims no speed until the service has stated one', () => {
+  const text = visibleText(render(<ReadOnlyNotice speed={null} />))
+
+  assert.doesNotMatch(text, /match pace/)
+  assert.match(text, /Server-controlled public replay/)
 })
 
 const SYNTHETIC_RUNTIME = {

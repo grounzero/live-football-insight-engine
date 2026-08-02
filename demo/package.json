@@ -10,7 +10,7 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test:ssr": "vite build --ssr test/layout.test.jsx --outDir .ssr-test --emptyOutDir && node --test .ssr-test/layout.test.js"
+    "test:ssr": "vite build --ssr test/layout.test.jsx --outDir .ssr-test --emptyOutDir && vite build --ssr test/playout.test.jsx --outDir .ssr-test/playout --emptyOutDir && node --test .ssr-test/layout.test.js .ssr-test/playout/playout.test.js"
   },
   "dependencies": {
     "react": "^19.2.0",

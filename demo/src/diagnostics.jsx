@@ -158,6 +158,50 @@ function replayRows({ replay, stale, lastSeen }) {
   ]
 }
 
+/**
+ * What the smoothing layer is actually doing.
+ *
+ * Here rather than on the page because it answers an engineer's question, not a
+ * viewer's: whether the pitch looks smooth because the network is behaving or
+ * because the buffer is absorbing something. Those need opposite responses and
+ * are indistinguishable from the animation alone.
+ *
+ * Read on render, which is a few times a second — the buffer itself is written
+ * at twenty and sampled at sixty, and neither of those goes through React.
+ */
+function playoutRows({ stream }) {
+  const stats = stream.playout?.stats?.() ?? null
+  if (stats === null) return [{ label: 'Playout', value: ABSENT }]
+  const lag = stats.lagMs === null ? null : Math.round(stats.lagMs)
+  return [
+    { label: 'Buffer depth', value: `${stats.depth} frames` },
+    {
+      label: 'Playout lag',
+      value: lag === null ? ABSENT : `${lag} ms`,
+      // Only a starved buffer is a fault. Running long is the recovery limit
+      // doing its job after a gap, and it closes on its own.
+      tone: lag !== null && lag < 0 ? 'warn' : '',
+      note: `target ${stats.targetLagMs} ms`,
+    },
+    {
+      label: 'Underruns',
+      value: formatCount(stats.underruns),
+      tone: stats.underruns > 0 ? 'warn' : '',
+      note: stats.underruns > 0 ? 'display froze waiting for frames' : '',
+    },
+    { label: 'Frames buffered', value: formatCount(stats.received) },
+    {
+      label: 'Frames discarded',
+      value: formatCount(stats.dropped),
+      note: 'late, duplicate or already drawn',
+    },
+    { label: 'Replay speed', value: `${stats.speed}×` },
+    { label: 'Newest source time', value: stats.newestTime === null ? ABSENT : `${stats.newestTime.toFixed(2)}s` },
+    { label: 'Rendering at', value: stats.renderTime === null ? ABSENT : `${stats.renderTime.toFixed(2)}s` },
+    { label: 'Last buffer reset', value: stats.lastReset ?? 'never' },
+  ]
+}
+
 function editorialRows({ stream, stickyReason }) {
   const { suppression } = stream
   const suppressed = Object.values(suppression.counts).reduce((sum, v) => sum + v, 0)
@@ -203,6 +247,10 @@ export function DiagnosticsPanel(props) {
         <details open>
           <summary>Replay</summary>
           <Rows rows={replayRows(props)} />
+        </details>
+        <details open>
+          <summary>Playout</summary>
+          <Rows rows={playoutRows(props)} />
         </details>
         <details open>
           <summary>Editorial</summary>

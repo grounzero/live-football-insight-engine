@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
 import { keyFor } from './format.js'
+import { createPlayout } from './playout.js'
 
 /** Matches what `GET /insights` returns, so a refresh restores the same depth. */
 const MAX_INSIGHTS = 20
@@ -19,6 +20,19 @@ const STALE_AFTER_FAILURES = 3
 
 /** Frames a suppression reason must hold before it is worth displaying. */
 const REASON_HOLD = 4
+
+/**
+ * How often frame-derived *text* is written into React state.
+ *
+ * The pitch no longer reads from React at all — it samples the playout buffer
+ * on the display's own clock — so the only consumers left are a clock, a
+ * confidence meter and an accessible label. None of them can be read faster
+ * than this, and each state write re-renders the page. Publishing twenty a
+ * second so that a clock showing whole seconds could be right sooner was the
+ * expensive half of the old design.
+ */
+const TEXT_UPDATE_HZ = 5
+const TEXT_UPDATE_MS = 1000 / TEXT_UPDATE_HZ
 
 const DIAGNOSTICS_KEY = 'fi.diagnostics'
 
@@ -55,8 +69,8 @@ export function useDiagnosticsPreference() {
 /**
  * Sparkline resolution.
  *
- * Frames arrive at 12.5 Hz; a 300-pixel sparkline cannot show that many
- * distinct points and re-rendering a long polyline twelve times a second is
+ * Frames arrive at about 20 Hz; a 300-pixel sparkline cannot show that many
+ * distinct points and re-rendering a long polyline twenty times a second is
  * work nobody can see. Every fourth frame is kept, carrying the *maximum* of
  * the four rather than the last: a spike that crossed the reporting line is the
  * one thing a trend must not hide.
@@ -208,6 +222,7 @@ export function useInsightStream() {
     counts: {},
   })
   const [reason, setReason] = useState(null)
+  const [stickyReason, setStickyReason] = useState(null)
   const [framesSeen, setFramesSeen] = useState(0)
   const [malformed, setMalformed] = useState(0)
   const [endedFrames, setEndedFrames] = useState(null)
@@ -219,16 +234,30 @@ export function useInsightStream() {
   statusRef.current = status
   const groupRef = useRef([])
   const errorsRef = useRef(0)
+  // Exact counts and run lengths, kept out of state so every frame can be
+  // counted without every frame causing a render.
+  const tallyRef = useRef({ frames: 0, flushedAt: 0 })
+  const runRef = useRef({ value: undefined, count: 0 })
 
-  const clearReplayState = useCallback(() => {
+  // The pitch's frame source, and the one object here that outlives a render.
+  // Created lazily rather than as a `useRef` argument, which would build a
+  // buffer on every render and throw all but the first away.
+  const playoutRef = useRef(null)
+  if (playoutRef.current === null) playoutRef.current = createPlayout()
+
+  const clearReplayState = useCallback((barrier) => {
+    playoutRef.current.reset(barrier)
     setInsights([])
     setHistory([])
     setSuppression({ frames: 0, emitted: 0, counts: {} })
     setReason(null)
+    setStickyReason(null)
     setFramesSeen(0)
     setMalformed(0)
     setEndedFrames(null)
     groupRef.current = []
+    tallyRef.current = { frames: 0, flushedAt: 0 }
+    runRef.current = { value: undefined, count: 0 }
   }, [])
 
   /**
@@ -241,7 +270,7 @@ export function useInsightStream() {
    * resubscribe is recovered from history rather than lost.
    */
   const reopen = useCallback(() => {
-    clearReplayState()
+    clearReplayState('reopen')
     setStatus('connecting')
     errorsRef.current = 0
     setGeneration((n) => n + 1)
@@ -272,19 +301,47 @@ export function useInsightStream() {
     }
 
     const onFrame = (payload) => {
-      setFrame(payload)
+      // The pitch's copy. No state is written here: this runs about twenty
+      // times a second, and the canvas reads the buffer on its own clock.
+      playoutRef.current.push(payload)
+
       const scored = payload.window_valid ? payload.probability : null
-      setProbability(scored)
-      setReason(payload.suppression ?? null)
-      setFramesSeen((n) => n + 1)
+      const tally = tallyRef.current
+      tally.frames += 1
+
+      // A suppression reason is decided per frame and flickers between two or
+      // three values faster than any of them can be read, so a reason is
+      // adopted only once it has been the answer four frames running. Counted
+      // here, against every frame, rather than in an effect against throttled
+      // state — a throttled tick would see one frame in four and stretch the
+      // hold from a third of a second to well over one.
+      const run = runRef.current
+      const raw = payload.suppression ?? null
+      if (raw === run.value) run.count += 1
+      else {
+        run.value = raw
+        run.count = 1
+      }
 
       const group = groupRef.current
       group.push(scored)
-      if (group.length < SPARK_EVERY) return
-      const values = group.filter((p) => p !== null && p !== undefined)
-      const point = values.length ? Math.max(...values) : null
-      groupRef.current = []
-      setHistory((current) => [...current, point].slice(-SPARK_POINTS))
+      if (group.length >= SPARK_EVERY) {
+        const values = group.filter((p) => p !== null && p !== undefined)
+        const point = values.length ? Math.max(...values) : null
+        groupRef.current = []
+        setHistory((current) => [...current, point].slice(-SPARK_POINTS))
+      }
+
+      // Everything below is text. Throttled, because each of these is a render
+      // of the whole page and none of it can be read at frame rate.
+      const now = Date.now()
+      if (now - tally.flushedAt < TEXT_UPDATE_MS) return
+      tally.flushedAt = now
+      setFrame(payload)
+      setProbability(scored)
+      setReason(raw)
+      setFramesSeen(tally.frames)
+      if (run.count >= REASON_HOLD) setStickyReason(raw)
     }
 
     const onSuppression = (payload) => {
@@ -309,9 +366,12 @@ export function useInsightStream() {
       insight: (payload) => setInsights((current) => mergeInsights(current, [payload])),
       suppression: onSuppression,
       // The frame is deliberately kept until the next one arrives, so the pitch
-      // does not blank for a moment on every restart.
+      // does not blank for a moment on every restart. The playout buffer is
+      // still cleared: its samples are from the end of the previous lap, and
+      // blending them into the first frame of the new one would walk every
+      // player back across the pitch.
       restart: () => {
-        clearReplayState()
+        clearReplayState('restart')
         setStatus('live')
       },
       // Sent by the server, not inferred from the click, so every open tab
@@ -319,7 +379,7 @@ export function useInsightStream() {
       // stream stays open throughout: the connection is fine, the match behind
       // it is being replaced.
       match: (payload) => {
-        clearReplayState()
+        clearReplayState('match')
         setSwitchingTo(payload?.loading ? (payload?.match_id ?? null) : null)
         setStatus('live')
       },
@@ -355,56 +415,20 @@ export function useInsightStream() {
 
   return {
     frame,
+    playout: playoutRef.current,
     probability,
     insights,
     status,
     history,
     suppression,
     reason,
+    stickyReason,
     framesSeen,
     malformed,
     endedFrames,
     switchingTo,
     reopen,
   }
-}
-
-/**
- * Hold a suppression reason until a new one has persisted.
- *
- * The reason is decided per frame, so the raw field flickers between two or
- * three values faster than any of them can be read. A reason is adopted only
- * once it has been the answer four frames running — about a third of a second
- * of match time, which is roughly the shortest label a reader can take in.
- *
- * `tick` is the frame counter rather than the reason itself: consecutive frames
- * usually carry the *same* reason, so an effect keyed on the value alone would
- * never re-run and the run length would never grow.
- */
-export function useStickyReason(reason, tick) {
-  const [sticky, setSticky] = useState(null)
-  const runRef = useRef({ value: undefined, count: 0, tick: -1 })
-
-  useEffect(() => {
-    const run = runRef.current
-    if (tick === run.tick) return
-    // The counter restarting means the replay did; nothing carries over.
-    if (tick < run.tick) {
-      runRef.current = { value: undefined, count: 0, tick }
-      setSticky(null)
-      return
-    }
-    run.tick = tick
-    if (reason === run.value) {
-      run.count += 1
-    } else {
-      run.value = reason
-      run.count = 1
-    }
-    if (run.count >= REASON_HOLD) setSticky(reason ?? null)
-  }, [reason, tick])
-
-  return sticky
 }
 
 /**

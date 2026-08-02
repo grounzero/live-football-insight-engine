@@ -16,12 +16,18 @@ const GOAL_DEPTH = 1.8
 const CENTRE_CIRCLE = 9.15
 
 /**
- * Size the backing store for the device pixel ratio and return a drawing context.
+ * Size the backing store for the device pixel ratio and return a projection.
  *
  * Returns the CSS-pixel dimensions and a metre-to-pixel projection, so nothing
  * downstream has to know about the pixel ratio again.
+ *
+ * Called on mount and on resize, not per frame. Reading `clientWidth` is a
+ * layout query, and the draw loop now runs at the display's refresh rate rather
+ * than the network's — asking the browser to measure the page sixty times a
+ * second to discover a number that changes when someone drags a window is work
+ * for nothing.
  */
-function prepareCanvas(canvas) {
+function measureCanvas(canvas) {
   const ctx = canvas.getContext('2d')
   const dpr = window.devicePixelRatio || 1
   const cssWidth = canvas.clientWidth
@@ -32,7 +38,6 @@ function prepareCanvas(canvas) {
     canvas.style.height = `${cssHeight}px`
   }
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-  ctx.clearRect(0, 0, cssWidth, cssHeight)
 
   const scale = cssWidth / LENGTH
   return {
@@ -181,51 +186,81 @@ export function Legend() {
 /**
  * Draws the pitch, players and ball on a canvas.
  *
- * The canvas is redrawn from the latest frame only; no animation state is kept,
- * so a dropped or late frame simply shows the previous position rather than
- * interpolating something that was never observed.
+ * Drawing is driven by `requestAnimationFrame` and reads from the playout
+ * buffer, not from React state on message arrival. That inversion is the whole
+ * point. The server publishes about twenty pictures a second and the network
+ * delivers them unevenly; a canvas redrawn on arrival inherits that unevenness
+ * exactly, and over the public internet it reads as the pitch freezing and then
+ * lurching. Sampling a buffered, timestamped stream on the display's own clock
+ * decouples the two, and the positions between real frames are interpolated
+ * rather than invented — see `playout.js`.
+ *
+ * @param {object} props
+ * @param {object} props.playout The shared playout buffer, a stable object.
+ * @param {object|null} props.frame The most recent frame as React state, used
+ *   only for the text description. It is deliberately throttled far below the
+ *   draw rate: this is a label, not an animation.
  */
-export default function Pitch({ frame }) {
+export default function Pitch({ playout, frame }) {
   const canvasRef = useRef(null)
-  const frameRef = useRef(frame)
-  frameRef.current = frame
+  const viewRef = useRef(null)
 
-  const draw = useCallback(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
+  const draw = useCallback((sample) => {
+    const view = viewRef.current
+    if (!view) return
 
-    const view = prepareCanvas(canvas)
-    const current = frameRef.current
-    const attackingRight = current?.attacking_right ?? null
+    view.ctx.clearRect(0, 0, view.cssWidth, view.cssHeight)
+    const attackingRight = sample?.attacking_right ?? null
 
     drawSurface(view)
     drawGoalAreas(view)
     drawAttackingBox(view, attackingRight)
     drawDirection(view, attackingRight)
 
-    if (!current) return
-    drawTeam(view, current.home, palette().home)
-    drawTeam(view, current.away, palette().away)
-    drawBall(view, current.ball)
+    if (!sample) return
+    drawTeam(view, sample.home, palette().home)
+    drawTeam(view, sample.away, palette().away)
+    drawBall(view, sample.ball)
   }, [])
-
-  useEffect(draw, [frame, draw])
 
   useEffect(() => {
     const canvas = canvasRef.current
     if (!canvas) return undefined
-    // The canvas is sized from its CSS width, and nothing recomputes that on its
-    // own. Mid-playback a stale size is corrected by the next frame 80 ms later;
-    // paused, finished or offline it stays wrong until a frame that never comes
-    // — which is exactly when someone resizes to look more closely.
-    const observer = new ResizeObserver(draw)
-    observer.observe(canvas)
-    return () => observer.disconnect()
-  }, [draw])
 
-  // Recomputed about once a second rather than on all 12.5 frames. `role="img"`
-  // is not a live region, so this is read on demand, not announced on change —
-  // narrating every position update would be unusable.
+    viewRef.current = measureCanvas(canvas)
+    // The canvas is sized from its CSS width, and nothing recomputes that on its
+    // own. The draw loop below no longer measures, so this is the only thing
+    // that notices a resize — including while the replay is paused, finished or
+    // offline, which is exactly when someone resizes to look more closely.
+    const observer = new ResizeObserver(() => {
+      viewRef.current = measureCanvas(canvas)
+    })
+    observer.observe(canvas)
+
+    let handle = 0
+    let previous = null
+    const tick = (now) => {
+      handle = requestAnimationFrame(tick)
+      // The first tick has no interval to advance over, and a tab returning from
+      // the background reports one that spans the whole time it was hidden. The
+      // clamp keeps that from being spent as replay time in a single step; the
+      // buffer's own recovery limit then closes the remaining gap smoothly.
+      if (previous !== null) playout.advance(Math.min((now - previous) / 1000, 0.25))
+      previous = now
+      draw(playout.sampleAt(playout.renderTime()))
+    }
+    handle = requestAnimationFrame(tick)
+
+    return () => {
+      cancelAnimationFrame(handle)
+      observer.disconnect()
+    }
+  }, [draw, playout])
+
+  // Recomputed about once a second, from state that updates a few times a
+  // second — never from the draw loop. `role="img"` is not a live region, so
+  // this is read on demand rather than announced on change; narrating sixty
+  // position updates a second would be unusable.
   const second = frame ? Math.floor(frame.match_time_s) : null
   const period = frame?.period ?? null
   const direction = directionText(frame)

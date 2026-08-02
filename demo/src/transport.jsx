@@ -13,6 +13,29 @@ import { ABSENT, formatClock, formatCount } from './format.js'
 
 const SPEEDS = [1, 2, 5, 10]
 
+/**
+ * What stands in for the controls on a public deployment.
+ *
+ * The rate is stated because the replay is faster than match pace and a viewer
+ * who assumed otherwise would be judging the football rather than the pipeline
+ * — every player would look impossibly quick. It comes from the running
+ * service rather than being written here, so the sentence cannot outlive a
+ * change to the deployment, and it is omitted entirely until the service has
+ * answered rather than guessed at.
+ *
+ * The reason the controls are absent is given, not just their absence: replay
+ * state is process-wide, so one visitor pausing would pause it for everyone.
+ */
+export function ReadOnlyNotice({ speed = null }) {
+  return (
+    <p className="transport-readonly">
+      Server-controlled public replay
+      {speed ? ` at ${speed}× match pace` : ''}, looping continuously. Playback controls are
+      disabled because every viewer shares one replay.
+    </p>
+  )
+}
+
 /** How long a spoken confirmation stays in the live region, in milliseconds. */
 const ANNOUNCE_MS = 4000
 

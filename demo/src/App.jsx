@@ -6,13 +6,12 @@ import {
   useReplayActions,
   useReplayControl,
   useServiceStatus,
-  useStickyReason,
 } from './hooks.js'
 import { InsightList } from './insights.jsx'
 import { useCapabilities } from './jobs.js'
 import { Confidence, Header, RuntimeStatus } from './panels.jsx'
 import { PipelinePanel } from './pipeline.jsx'
-import { Transport } from './transport.jsx'
+import { ReadOnlyNotice, Transport } from './transport.jsx'
 
 /**
  * Composes the demo from three independent data sources: service metadata, the
@@ -31,7 +30,7 @@ export default function App() {
   const { replay, matches, control, restart, selectMatch, pending, stale, lastSeen } =
     useReplayControl()
   const capabilities = useCapabilities()
-  const stickyReason = useStickyReason(stream.reason, stream.framesSeen)
+  const stickyReason = stream.stickyReason
   const [showDiagnostics, onToggleDiagnostics] = useDiagnosticsPreference()
 
   const threshold = model?.decision_threshold ?? 0.5
@@ -69,7 +68,7 @@ export default function App() {
 
       <main>
         <section className="pitch-panel">
-          <Pitch frame={stream.frame} />
+          <Pitch playout={stream.playout} frame={stream.frame} />
           <Legend />
           {showTransport ? (
             <Transport
@@ -84,10 +83,7 @@ export default function App() {
               switchingTo={stream.switchingTo}
             />
           ) : (
-            <p className="transport-readonly">
-              Server-controlled replay, looping continuously. Playback controls are disabled on the
-              public demo because every viewer shares one replay.
-            </p>
+            <ReadOnlyNotice speed={replay?.speed ?? null} />
           )}
         </section>
 
