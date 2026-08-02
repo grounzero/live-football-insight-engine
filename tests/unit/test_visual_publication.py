@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -29,13 +30,15 @@ from football_insights.serving.loader import (
     SYNTHETIC_MATCH_ID,
     SyntheticDemoMatchSource,
     build_engine,
+    demo_fixture_cycle,
 )
 from football_insights.serving.messages import StreamMessage, StreamMessageType, stream_message
 from football_insights.serving.metrics import Metrics
-from football_insights.serving.state import AppState
+from football_insights.serving.state import AppState, FixtureRotation
 from football_insights.serving.stream import (
     VISUAL_PUBLISH_HZ,
     VisualRateLimiter,
+    rotate_fixture,
     run_replay,
 )
 from football_insights.types import JsonDict
@@ -434,3 +437,110 @@ class TestFramePayload:
         assert times == sorted(times), "source time went backwards on the wire"
         assert ids == sorted(ids), "source frame ids went backwards on the wire"
         assert len(set(ids)) == len(ids), "the same source frame was published twice"
+
+
+class TestFixtureRotation:
+    """The public rotation, and the order its changeover must happen in."""
+
+    @staticmethod
+    def _public(period_s: float = 6.0) -> AppState:
+        """Public state with a three-fixture rotation, short enough to cycle fast."""
+        settings = Settings()
+        settings.service.public_demo = True
+        state = _state(settings, speed=0.0, period_s=period_s)
+
+        rotation: list[FixtureRotation] = []
+        for source in demo_fixture_cycle():
+            # The real fixtures, shortened: what is under test is the changeover,
+            # and five minutes of tracking per fixture would dominate the suite.
+            short = replace(source, period_duration_s=period_s)
+            tracking, events, orientation = short.load()
+            rotation.append(
+                FixtureRotation(
+                    match_id=source.match_id,
+                    name=source.profile.name,
+                    narrative=source.profile.narrative,
+                    tracking=tracking,
+                    events=events,
+                    orientation=orientation,
+                )
+            )
+        state.fixtures = tuple(rotation)
+
+        # Start on the first fixture, as bootstrap does.
+        first = state.fixtures[0]
+        state.player = ReplayPlayer(
+            match_id=first.match_id,
+            tracking=first.tracking,
+            profile=settings.fault_profile("clean"),
+            seed=1,
+            speed=0.0,
+        )
+        state.engine = build_engine(
+            settings,
+            first.tracking,
+            first.events,
+            first.orientation,
+            HeuristicPredictor(settings.model.threshold),
+            state.metrics,
+        )
+        return state
+
+    def test_the_rotation_is_three_distinct_archetypes(self) -> None:
+        state = self._public()
+        assert len({f.match_id for f in state.fixtures}) == 3
+        assert len({f.name for f in state.fixtures}) == 3
+
+    def test_rotation_advances_in_order_and_wraps(self) -> None:
+        state = self._public()
+        seen = [state.fixtures[state.fixture_index].match_id]
+        for _ in range(3):
+            seen.append(rotate_fixture(state) or "")
+
+        assert seen[:3] == [f.match_id for f in state.fixtures]
+        assert seen[3] == state.fixtures[0].match_id, "the rotation did not wrap"
+
+    def test_the_engine_is_rebuilt_before_the_new_fixture_is_scored(self) -> None:
+        """The hazard a changeover shares with a rewind.
+
+        A rolling window still holding five seconds of the previous match would
+        be scored as though play were continuous, and the engine's monotonic
+        frame check would sit at the end of one fixture while the next starts
+        from frame one — every frame of it rejected as out of order.
+        """
+        state = self._public()
+        before = state.engine
+        rotate_fixture(state)
+
+        assert state.engine is not before, "the engine survived the changeover"
+        assert state.player is not None
+        assert state.player.status().match_id == state.fixtures[1].match_id
+
+    def test_the_barrier_precedes_the_announcement_and_the_first_frame(self) -> None:
+        state = self._public()
+        queue = state.subscribe()
+        list(_messages(queue))  # drain the snapshot
+
+        rotate_fixture(state)
+        kinds = [m["type"] for m in _messages(queue)]
+
+        # A client clears its interpolation buffer on the barrier, then learns
+        # what it is about to draw. Reversing the two would have it blending the
+        # last frame of one fixture into the first of the next.
+        assert kinds[:2] == ["restart", "match"], kinds
+
+    def test_a_visitor_arriving_mid_changeover_is_not_shown_the_old_fixture(self) -> None:
+        state = self._public()
+        state.publish_frame(
+            stream_message(StreamMessageType.FRAME, {"fixture": "old", "match_time_s": 5.0})
+        )
+        rotate_fixture(state)
+
+        seeded = list(_messages(state.subscribe()))
+        assert [m["type"] for m in seeded] == ["match"]
+        assert seeded[0]["payload"]["match_id"] == state.fixtures[1].match_id
+
+    def test_a_single_fixture_does_not_rotate(self) -> None:
+        """Outside the public rotation a match changes only when asked."""
+        state = _state(Settings(), speed=0.0)
+        assert rotate_fixture(state) is None

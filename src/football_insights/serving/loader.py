@@ -26,12 +26,13 @@ scattered through the route handlers.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, Protocol
 
 import numpy as np
 
 from football_insights.data.acquire import AVAILABLE_MATCHES, MATCHES_BY_ID, MatchFiles
+from football_insights.data.synthetic import DEFAULT_PROFILE, PROFILES, FixtureProfile
 from football_insights.errors import DataValidationError, SchemaVersionError
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
 from football_insights.models.heuristic import HeuristicPredictor
@@ -52,17 +53,42 @@ LOGGER = logging.getLogger("football_insights.loader")
 #: Preference order when no predictor is named in configuration.
 PREFERRED = ("gru-temporal", "baseline-gbdt", "baseline-logistic")
 
-#: Identifier for the generated fixture. Named so nobody can mistake it for a
-#: real fixture in a status payload, a log line or the demo's match picker.
-SYNTHETIC_MATCH_ID: Final = "Synthetic_Demo"
+#: Identifier prefix for the generated fixtures. Named so nobody can mistake
+#: one for a real fixture in a status payload, a log line or the demo's match
+#: picker.
+SYNTHETIC_MATCH_PREFIX: Final = "Synthetic_Demo"
 SYNTHETIC_SOURCE_FORMAT: Final = "synthetic"
 
-#: Fixture shape. Eight minutes of play at 25 Hz is roughly a minute of
-#: wall-clock at the demo's default 8x, which is long enough to produce many
-#: penalty-area entries and short enough that a visitor sees the replay loop
-#: rather than wondering whether it is stuck.
-SYNTHETIC_PERIODS: Final = 2
-SYNTHETIC_PERIOD_DURATION_S: Final = 240.0
+#: Retained as the id of the first public fixture, so an existing bookmark,
+#: configuration file or `--match Synthetic_Demo` keeps working.
+SYNTHETIC_MATCH_ID: Final = SYNTHETIC_MATCH_PREFIX
+
+#: Fixture shape. Five minutes of play at 25 Hz is roughly 75 seconds of
+#: wall-clock at the public demo's 4x, so all three archetypes are seen inside
+#: four minutes — short enough that a visitor giving the page a couple of
+#: minutes still watches the rotation happen rather than one fixture looping.
+SYNTHETIC_PERIODS: Final = 1
+SYNTHETIC_PERIOD_DURATION_S: Final = 300.0
+
+#: Seed offset for the public fixtures.
+#:
+#: The hosted rotation must never be a fixture the demo model was fitted,
+#: early-stopped or thresholded on, or the page would be showing a model its
+#: own training data and calling the result a demonstration. The training seeds
+#: live in :mod:`football_insights.models.demo_model` and are derived from a
+#: different base; this offset keeps the two sets provably disjoint, and a test
+#: asserts it rather than trusting the arithmetic.
+PUBLIC_FIXTURE_SEED_BASE: Final = 900_000
+
+
+def public_fixture_id(profile_key: str) -> str:
+    """Match id for one public fixture."""
+    return f"{SYNTHETIC_MATCH_PREFIX}_{profile_key}"
+
+
+def public_fixture_seed(index: int) -> int:
+    """Seed for the public fixture at ``index`` in the rotation."""
+    return PUBLIC_FIXTURE_SEED_BASE + index
 
 
 class MatchSource(Protocol):
@@ -157,7 +183,8 @@ class SyntheticDemoMatchSource:
     seed: int = 42
     n_periods: int = SYNTHETIC_PERIODS
     period_duration_s: float = SYNTHETIC_PERIOD_DURATION_S
-    match_id: str = field(default=SYNTHETIC_MATCH_ID, init=False)
+    profile: FixtureProfile = DEFAULT_PROFILE
+    match_id: str = SYNTHETIC_MATCH_ID
 
     @property
     def data_source(self) -> str:
@@ -176,8 +203,29 @@ class SyntheticDemoMatchSource:
             seed=self.seed,
             n_periods=self.n_periods,
             period_duration_s=self.period_duration_s,
+            profile=self.profile,
         )
         return match.tracking, match.events, match.orientation
+
+
+def demo_fixture_cycle() -> tuple[SyntheticDemoMatchSource, ...]:
+    """The public rotation, in order: one fixture per tactical archetype.
+
+    Built here rather than at import so the seeds and the profile list stay in
+    one place, and so a caller cannot accidentally rotate through two fixtures
+    that differ only by seed.
+
+    Returns:
+        One source per profile, each on a seed reserved for public use.
+    """
+    return tuple(
+        SyntheticDemoMatchSource(
+            seed=public_fixture_seed(index),
+            profile=profile,
+            match_id=public_fixture_id(profile.key),
+        )
+        for index, profile in enumerate(PROFILES)
+    )
 
 
 def resolve_match_source(settings: Settings, match_id: str) -> MatchSource:
@@ -195,7 +243,13 @@ def resolve_match_source(settings: Settings, match_id: str) -> MatchSource:
     Returns:
         The source that can produce it.
     """
+    for source in demo_fixture_cycle():
+        if source.match_id == match_id:
+            return source
     if match_id == SYNTHETIC_MATCH_ID:
+        # The bare prefix predates the rotation and is kept working, on the
+        # configured seed rather than a public one so a local run with an
+        # explicit `replay.seed` still honours it.
         return SyntheticDemoMatchSource(seed=settings.replay.seed)
     return MetricaMatchSource(settings, match_id)
 
@@ -204,7 +258,9 @@ def default_match_id(settings: Settings) -> str:
     """The match to replay when nobody named one."""
     if settings.replay.match_id:
         return settings.replay.match_id
-    return SYNTHETIC_MATCH_ID if settings.service.public_demo else "Sample_Game_2"
+    if settings.service.public_demo:
+        return demo_fixture_cycle()[0].match_id
+    return "Sample_Game_2"
 
 
 def _catalogued(match_id: str) -> MatchFiles:
@@ -261,12 +317,19 @@ def available_matches(raw_dir: Path, *, public_demo: bool = False) -> tuple[Json
         One entry per playable match, in catalogue order.
     """
     if public_demo:
-        return (
+        # All three, and all playable: they are generated, so there is nothing
+        # to download and nothing that can be missing. Listing them is not an
+        # offer to switch — the mutating routes are still withheld — it is how
+        # a viewer can see what the rotation contains.
+        return tuple(
             {
-                "id": SYNTHETIC_MATCH_ID,
+                "id": source.match_id,
                 "source_format": SYNTHETIC_SOURCE_FORMAT,
                 "available": True,
-            },
+                "name": source.profile.name,
+                "narrative": source.profile.narrative,
+            }
+            for source in demo_fixture_cycle()
         )
     return tuple(
         {

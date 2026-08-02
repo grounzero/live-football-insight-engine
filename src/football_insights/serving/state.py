@@ -20,10 +20,29 @@ from football_insights.serving.messages import StreamMessage
 from football_insights.serving.metrics import Metrics
 
 if TYPE_CHECKING:
+    from football_insights.domain import Event, MatchTracking, Orientation
     from football_insights.replay.player import ReplayPlayer
     from football_insights.serving.engine import InsightEngine
 
 _Subscriber = asyncio.Queue[StreamMessage]
+
+
+@dataclass(frozen=True, slots=True)
+class FixtureRotation:
+    """One fixture in the public rotation, pre-built at startup.
+
+    Tracking, events and orientation are generated once and held, rather than
+    regenerated at each changeover. Generating a five-minute fixture takes about
+    a quarter of a second, which is a long time to stall the event loop in the
+    middle of a replay every viewer is watching.
+    """
+
+    match_id: str
+    name: str
+    narrative: str
+    tracking: MatchTracking
+    events: tuple[Event, ...]
+    orientation: Orientation
 
 
 @dataclass
@@ -41,6 +60,11 @@ class AppState:
     #: usable deployment however healthy the API is.
     ui_available: bool = False
     recent_insights: list[Insight] = field(default_factory=list[Insight])
+    #: The public rotation, and where in it the replay currently is. Empty
+    #: outside public-demo mode, where a single match loops as before and
+    #: changing it is an explicit request rather than a schedule.
+    fixtures: tuple[FixtureRotation, ...] = ()
+    fixture_index: int = 0
     _subscribers: set[_Subscriber] = field(default_factory=set[_Subscriber])
     _task: asyncio.Task[None] | None = None
     _restart: bool = False

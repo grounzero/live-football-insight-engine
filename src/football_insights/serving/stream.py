@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Final
 
 import numpy as np
 
+from football_insights.replay.player import ReplayPlayer
 from football_insights.serving.logging import new_correlation_id
 from football_insights.serving.messages import StreamMessageType, stream_message
 from football_insights.types import JsonDict
@@ -343,6 +344,152 @@ def _publish_results(
         )
 
 
+async def _play_fixture(state: AppState, visual: VisualRateLimiter, *, loop: bool) -> int | None:
+    """Drive one fixture through the engine until it ends.
+
+    Args:
+        state: Shared application state; supplies the current player and engine.
+        visual: The publish schedule, shared across fixtures so a changeover
+            does not reset the browser's frame rate.
+        loop: Restart this fixture at its end instead of returning. Only ever
+            true when there is no rotation to advance to.
+
+    Returns:
+        Frames processed, or ``None`` when the loop should stop entirely
+        because nobody is watching a public demo.
+    """
+    player = state.player
+    engine = state.engine
+    if player is None or engine is None:
+        return 0
+
+    rollup = SuppressionRollup()
+    counter = 0
+    laps = player.laps
+    match_id = player.status().match_id
+    period: int | None = None
+
+    async for emitted in player.stream(loop=loop):
+        if state.take_restart():
+            # This frame was taken from the old position before the request
+            # arrived. Processing it would leave the engine's monotonic frame
+            # check ahead of everything about to be replayed, and every frame
+            # of the new run would be rejected as out of order — while the
+            # pitch kept animating, because frames are published whether or
+            # not the engine accepted them. A dead demo that looks alive.
+            apply_restart(state, engine)
+            rollup = SuppressionRollup()
+            counter = 0
+            laps = player.laps
+            # A barrier the client answers by clearing its interpolation
+            # buffer, so it has nothing to draw until the next picture. The
+            # schedule is dropped rather than honoured so that picture is the
+            # very next frame.
+            visual.reset()
+            continue
+
+        if player.laps != laps:
+            # A looping replay has wrapped. Same hazard as a restart, arriving
+            # without anyone asking: the engine's last frame id is at the end
+            # of the match and every frame of the new lap would be dropped as
+            # out of order. Unlike a restart there is no stale frame to
+            # discard — this one is the first frame of the new lap — so the
+            # state is rebuilt and the frame then falls through to be
+            # processed rather than skipped.
+            laps = player.laps
+            apply_restart(state, engine)
+            rollup = SuppressionRollup()
+            counter = 0
+            visual.reset()
+
+        if state.should_stop_unwatched():
+            LOGGER.info(
+                "no subscribers; stopping the replay until someone connects",
+                extra={"frames": counter},
+            )
+            return None
+
+        counter += 1
+        frame = emitted.frame
+
+        # A period change is a barrier for the same reason a lap is: the
+        # teams have swapped ends, so interpolating from the last frame of
+        # one half into the first of the next would walk twenty-two players
+        # across the halfway line over 50 ms.
+        barrier = period is not None and frame.period != period
+        period = frame.period
+
+        _publish_results(
+            state,
+            frame,
+            engine.process(frame),
+            rollup,
+            VisualContext(match_id=match_id, lap=laps, speed=player.speed),
+            publish_frame=visual.due(force=barrier),
+        )
+    return counter
+
+
+def rotate_fixture(state: AppState) -> str | None:
+    """Install the next fixture in the public rotation.
+
+    The order below is the whole of the correctness argument, and every step is
+    load-bearing:
+
+    1. the barrier, so a client stops drawing the fixture that is ending;
+    2. the engine and editorial state, rebuilt before any new frame reaches
+       them — a rolling window holding the last five seconds of a different
+       match would be scored as though it were continuous, and the monotonic
+       frame check would reject the new fixture outright;
+    3. the announcement, naming what is about to play;
+    4. the first frame, which the replay loop publishes on its next pass.
+
+    Frames carry their own fixture id as well, so a client that somehow missed
+    the barrier still cannot blend two matches together. Ordering here is what
+    makes the *server* correct; the frame metadata is what stops the client
+    depending on it.
+
+    Args:
+        state: Shared application state; must have a populated rotation.
+
+    Returns:
+        The new match id, or ``None`` when there is no rotation to advance.
+    """
+    from football_insights.serving.loader import build_engine
+
+    if len(state.fixtures) < 2 or state.engine is None or state.player is None:
+        return None
+
+    speed = state.player.speed
+    status = state.player.status()
+    state.fixture_index = (state.fixture_index + 1) % len(state.fixtures)
+    fixture = state.fixtures[state.fixture_index]
+
+    state.publish_barrier(stream_message(StreamMessageType.RESTART, {}))
+    state.engine = build_engine(
+        state.settings,
+        fixture.tracking,
+        fixture.events,
+        fixture.orientation,
+        state.engine.predictor,
+        state.metrics,
+    )
+    state.recent_insights.clear()
+    state.player = ReplayPlayer(
+        match_id=fixture.match_id,
+        tracking=fixture.tracking,
+        profile=state.settings.fault_profile(status.profile),
+        seed=status.seed,
+        speed=speed,
+    )
+    announce_match(state, fixture.match_id, loading=False)
+    LOGGER.info(
+        "fixture rotated",
+        extra={"match_id": fixture.match_id, "profile": fixture.name, "speed": speed},
+    )
+    return fixture.match_id
+
+
 async def run_replay(state: AppState, clock: Callable[[], float] | None = None) -> None:
     """Drive the replay through the engine and publish results.
 
@@ -370,70 +517,26 @@ async def run_replay(state: AppState, clock: Callable[[], float] | None = None) 
         },
     )
     visual = VisualRateLimiter(clock=clock)
-    rollup = SuppressionRollup()
     counter = 0
-    laps = player.laps
-    match_id = status.match_id
-    period: int | None = None
+    # With a rotation configured, each fixture plays once and the loop below
+    # advances to the next. Looping a single player would replay one archetype
+    # for ever, and swapping mid-player would leave the engine holding a rolling
+    # window from a different match.
+    rotating = len(state.fixtures) >= 2
     try:
-        async for emitted in player.stream(loop=state.settings.replay.loop):
-            if state.take_restart():
-                # This frame was taken from the old position before the request
-                # arrived. Processing it would leave the engine's monotonic frame
-                # check ahead of everything about to be replayed, and every frame
-                # of the new run would be rejected as out of order — while the
-                # pitch kept animating, because frames are published whether or
-                # not the engine accepted them. A dead demo that looks alive.
-                apply_restart(state, engine)
-                rollup = SuppressionRollup()
-                counter = 0
-                laps = player.laps
-                # A barrier the client answers by clearing its interpolation
-                # buffer, so it has nothing to draw until the next picture. The
-                # schedule is dropped rather than honoured so that picture is the
-                # very next frame.
-                visual.reset()
-                continue
-
-            if player.laps != laps:
-                # A looping replay has wrapped. Same hazard as a restart, arriving
-                # without anyone asking: the engine's last frame id is at the end
-                # of the match and every frame of the new lap would be dropped as
-                # out of order. Unlike a restart there is no stale frame to
-                # discard — this one is the first frame of the new lap — so the
-                # state is rebuilt and the frame then falls through to be
-                # processed rather than skipped.
-                laps = player.laps
-                apply_restart(state, engine)
-                rollup = SuppressionRollup()
-                counter = 0
-                visual.reset()
-
-            if state.should_stop_unwatched():
-                LOGGER.info(
-                    "no subscribers; stopping the replay until someone connects",
-                    extra={"frames": counter},
-                )
-                return
-
-            counter += 1
-            frame = emitted.frame
-
-            # A period change is a barrier for the same reason a lap is: the
-            # teams have swapped ends, so interpolating from the last frame of
-            # one half into the first of the next would walk twenty-two players
-            # across the halfway line over 50 ms.
-            barrier = period is not None and frame.period != period
-            period = frame.period
-
-            _publish_results(
-                state,
-                frame,
-                engine.process(frame),
-                rollup,
-                VisualContext(match_id=match_id, lap=laps, speed=player.speed),
-                publish_frame=visual.due(force=barrier),
+        while True:
+            played = await _play_fixture(
+                state, visual, loop=state.settings.replay.loop and not rotating
             )
+            if played is None:
+                # Nobody is watching. The player is left where it is, so the
+                # next subscriber picks the same fixture up mid-match.
+                return
+            counter += played
+            if not rotating:
+                break
+            visual.reset()
+            rotate_fixture(state)
     except asyncio.CancelledError:  # pragma: no cover - shutdown
         raise
     finally:

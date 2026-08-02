@@ -31,9 +31,10 @@ from football_insights.config import (
     resolve_port,
     resolve_replay_speed,
 )
-from football_insights.data.synthetic import generate_synthetic_match
+from football_insights.data.synthetic import PROFILES, generate_synthetic_match
 from football_insights.errors import ConfigurationError, DataValidationError
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
+from football_insights.models.demo_model import DEMO_FIXTURES_PER_PROFILE, training_seed
 from football_insights.models.heuristic import HeuristicPredictor
 from football_insights.replay.player import ReplayPlayer
 from football_insights.serving import app as app_module
@@ -50,6 +51,7 @@ from football_insights.serving.loader import (
     available_matches,
     build_engine,
     default_match_id,
+    demo_fixture_cycle,
     load_predictor,
     resolve_match_source,
 )
@@ -248,7 +250,10 @@ class TestPublicDemoSettings:
 
         public = Settings()
         public.service.public_demo = True
-        assert default_match_id(public) == SYNTHETIC_MATCH_ID
+        # The first fixture of the rotation, not the bare prefix: a public
+        # deployment plays three archetypes in turn.
+        assert default_match_id(public) == demo_fixture_cycle()[0].match_id
+        assert default_match_id(public).startswith(SYNTHETIC_MATCH_ID)
 
     def test_an_explicit_configured_match_wins_in_either_mode(self) -> None:
         settings = Settings()
@@ -282,10 +287,47 @@ class TestMatchSourceSelection:
             resolve_match_source(settings, SYNTHETIC_MATCH_ID), SyntheticDemoMatchSource
         )
 
-    def test_public_mode_lists_only_the_fixture(self) -> None:
+    def test_public_mode_lists_only_generated_fixtures(self) -> None:
         catalogue = available_matches(NOWHERE, public_demo=True)
-        assert [m["id"] for m in catalogue] == [SYNTHETIC_MATCH_ID]
-        assert catalogue[0]["available"] is True
+
+        assert [m["id"] for m in catalogue] == [s.match_id for s in demo_fixture_cycle()]
+        # Generated, so there is nothing to download and nothing that can be
+        # missing — unlike the Metrica catalogue below.
+        assert all(m["available"] is True for m in catalogue)
+        assert all(m["source_format"] == "synthetic" for m in catalogue)
+        # Each carries the wording the page shows, so the UI does not keep its
+        # own copy of a description the generator owns.
+        assert all(m["name"] and m["narrative"] for m in catalogue)
+
+    def test_the_hosted_fixtures_were_never_used_to_build_the_model(self) -> None:
+        """The one property that makes the hosted demo a demonstration.
+
+        The demo model is fitted, early-stopped and thresholded on six generated
+        fixtures. If the three the public sees were among them, the page would be
+        scoring the model's own training data and presenting the result as
+        evidence that the pipeline works.
+
+        Asserted on the seeds rather than trusting two constants in different
+        modules to stay far apart.
+        """
+        public = {source.seed for source in demo_fixture_cycle()}
+        development = {
+            training_seed(index) for index in range(len(PROFILES) * DEMO_FIXTURES_PER_PROFILE)
+        }
+
+        assert public & development == set(), (
+            f"the hosted rotation reuses development seeds {sorted(public & development)}"
+        )
+        assert len(public) == len(PROFILES)
+        assert len(development) == len(PROFILES) * DEMO_FIXTURES_PER_PROFILE
+
+    def test_the_public_rotation_is_three_distinct_archetypes(self) -> None:
+        cycle = demo_fixture_cycle()
+
+        assert len(cycle) == 3
+        assert len({s.match_id for s in cycle}) == 3
+        assert len({s.profile.key for s in cycle}) == 3
+        assert len({s.seed for s in cycle}) == 3
 
     def test_local_mode_still_lists_the_dataset(self) -> None:
         catalogue = available_matches(NOWHERE)
@@ -332,14 +374,18 @@ class TestSyntheticSource:
         # The ball may legitimately be absent; nothing else may be.
         assert np.isfinite(tracking.ball_xy).mean() > 0.9
 
-    def test_it_runs_long_enough_to_be_worth_watching(self) -> None:
+    def test_a_fixture_is_short_enough_to_see_the_whole_rotation(self) -> None:
         tracking, _, _ = SyntheticDemoMatchSource().load()
 
-        # Two periods of four minutes: about a minute of wall-clock at the
-        # demo's 8x, which is long enough to see the replay loop.
-        assert tracking.duration_s >= 400.0
-        assert tracking.n_frames >= 10_000
-        assert set(np.unique(tracking.period)) == {1, 2}
+        # Five minutes of match time is about 75 seconds at the public demo's
+        # 4x, so three archetypes play through inside four minutes. A visitor
+        # who gives the page a couple of minutes has to see the rotation
+        # happen, not one fixture looping.
+        assert 280.0 <= tracking.duration_s <= 320.0
+        wall_clock_cycle_s = tracking.duration_s * len(demo_fixture_cycle()) / 4.0
+        assert wall_clock_cycle_s < 240.0, (
+            f"a full rotation takes {wall_clock_cycle_s:.0f}s of wall clock at 4x"
+        )
 
     def test_it_produces_the_event_the_demo_is_about(self) -> None:
         match: SyntheticMatch = generate_synthetic_match(

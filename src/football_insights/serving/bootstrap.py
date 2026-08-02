@@ -19,12 +19,14 @@ from football_insights.serving.loader import (
     available_matches,
     build_engine,
     default_match_id,
+    demo_fixture_cycle,
     load_match,
     load_predictor,
     load_replay,
     resolve_match_source,
 )
 from football_insights.serving.metrics import Metrics
+from football_insights.serving.state import FixtureRotation
 
 if TYPE_CHECKING:
     from fastapi import FastAPI
@@ -72,8 +74,40 @@ def create_configured_app(
     """
     resolved_speed = resolve_replay_speed(speed, settings)
     resolved_id = match_id or default_match_id(settings)
-    source = resolve_match_source(settings, resolved_id)
-    tracking, events, orientation = source.load()
+
+    # The public rotation is generated once, here, rather than at each
+    # changeover: a five-minute fixture takes about a quarter of a second to
+    # produce, which is a long time to stall the event loop in the middle of a
+    # replay every viewer is watching. Three of them add well under a second to
+    # startup, and the health check allows minutes.
+    #
+    # Only when nobody named a match. An explicit `--match` is a request to play
+    # that one, and rotating away from it would ignore the instruction.
+    rotation: list[FixtureRotation] = []
+    if settings.service.public_demo and match_id is None and not settings.replay.match_id:
+        for fixture in demo_fixture_cycle():
+            loaded_tracking, loaded_events, loaded_orientation = fixture.load()
+            rotation.append(
+                FixtureRotation(
+                    match_id=fixture.match_id,
+                    name=fixture.profile.name,
+                    narrative=fixture.profile.narrative,
+                    tracking=loaded_tracking,
+                    events=loaded_events,
+                    orientation=loaded_orientation,
+                )
+            )
+
+    if rotation:
+        # The first of the rotation is what plays first; loading it again
+        # through `resolve_match_source` would generate the same fixture twice.
+        first = rotation[0]
+        resolved_id = first.match_id
+        source = resolve_match_source(settings, resolved_id)
+        tracking, events, orientation = first.tracking, first.events, first.orientation
+    else:
+        source = resolve_match_source(settings, resolved_id)
+        tracking, events, orientation = source.load()
     metrics = Metrics()
     predictor = load_predictor(settings)
     engine = build_engine(settings, tracking, events, orientation, predictor, metrics)
@@ -98,4 +132,6 @@ def create_configured_app(
             "threshold": predictor.metadata.threshold,
         },
     )
-    return create_app(settings, engine, player, metrics, data_source=source.data_source)
+    app = create_app(settings, engine, player, metrics, data_source=source.data_source)
+    app.state.fi.fixtures = tuple(rotation)
+    return app
