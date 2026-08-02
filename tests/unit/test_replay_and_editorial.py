@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from collections.abc import Callable
 from itertools import pairwise
 from unittest import mock
@@ -463,3 +464,54 @@ class TestReplayPacing:
 
         assert stub.requested, "replay sprinted after rewinding: no frame was paced"
         assert max(stub.requested) < 1.0, f"stalled for {max(stub.requested):.1f}s after rewinding"
+
+    async def test_a_replay_running_behind_still_yields_to_the_event_loop(
+        self, settings: Settings, match: SyntheticMatch
+    ) -> None:
+        """A replay that cannot keep up must not stop the rest of the service.
+
+        On the paced path the pacing sleep is the *only* thing that returns
+        control to the event loop, and it disappears exactly when the replay
+        falls behind: `delay` goes negative, nothing is awaited, and resuming an
+        async generator does not reach the scheduler. The whole match then runs
+        in one uninterrupted burst.
+
+        Nothing about that is visible from the replay's own output — the frames
+        are all correct and all present. What breaks is everything else: no
+        subscriber is scheduled to receive them, `/health` and `/ready` do not
+        answer, and a platform watching those endpoints concludes the container
+        is dead and restarts it.
+
+        Real asyncio here, deliberately, rather than the stubs above: the whole
+        question is whether the event loop is reached, and a stub that fakes
+        sleeping cannot answer it.
+        """
+        player = self._player(settings, match, speed=50.0)
+        scheduled = 0
+
+        async def competing_work() -> None:
+            nonlocal scheduled
+            while True:
+                await asyncio.sleep(0)
+                scheduled += 1
+
+        task = asyncio.create_task(competing_work())
+        frames = 0
+        try:
+            async for _ in player.stream():
+                # Per-frame work beyond the budget the speed implies, which is
+                # what puts the loop behind: at 50x, 25 Hz frames allow 0.8 ms.
+                deadline = time.perf_counter() + 0.002
+                while time.perf_counter() < deadline:
+                    pass
+                frames += 1
+                if frames >= 200:
+                    player.stop()
+        finally:
+            task.cancel()
+
+        assert frames >= 200
+        assert scheduled > 0, (
+            "the replay ran 200 frames behind schedule without the event loop "
+            "being scheduled once: every other task in the process is starved"
+        )

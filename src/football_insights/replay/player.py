@@ -211,6 +211,7 @@ class ReplayPlayer:
             self._position += 1
             self._match_time_s = item.frame.time_s
 
+            paced = False
             if self._speed > 0:
                 if self._origin is None:
                     self._origin = item.frame.time_s
@@ -219,10 +220,25 @@ class ReplayPlayer:
                 delay = target - (time.perf_counter() - self._started)
                 if delay > 0:
                     await asyncio.sleep(delay)
-            else:
-                # Yield control so an unpaced replay cannot starve the loop.
-                if self._position % 64 == 0:
-                    await asyncio.sleep(0)
+                    paced = True
+
+            # Yield control periodically whenever the pacing sleep did not.
+            #
+            # That sleep is the only thing returning control to the event loop on
+            # the paced path, and it disappears the moment the replay falls
+            # behind schedule: `delay` goes negative, nothing is awaited, and
+            # resuming an async generator does not reach the scheduler. The loop
+            # then runs the entire match in one uninterrupted burst — no frame
+            # reaches a subscriber, `/health` and `/ready` do not answer, and a
+            # platform watching those decides the container is dead.
+            #
+            # Falling behind is not an edge case: it is what happens whenever
+            # per-frame work exceeds the budget the speed implies, which at 8x
+            # is 5 ms a frame and under coverage instrumentation is routinely
+            # less. The unpaced branch below has always guarded against this;
+            # the paced one needs the same guard for the same reason.
+            if not paced and self._position % 64 == 0:
+                await asyncio.sleep(0)
 
             yield item
 
