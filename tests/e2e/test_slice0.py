@@ -541,10 +541,19 @@ class TestInvalidWindowsProduceNothing:
         )
         assert invalid > 0, "a ten-second ball outage must invalidate windows"
 
-        # No insight may refer to any instant whose window overlaps the outage.
+        # No insight may refer to any instant whose window is *structurally
+        # invalid*, which is not the same as one that merely overlaps the
+        # outage: a window is scored while at least `min_valid_frame_ratio` of
+        # it is present, so the last second of a five-second window may be
+        # missing and the window still counts.
+        #
+        # Deriving the bound rather than assuming any overlap disqualifies:
+        # the looser assumption held only while the generator happened to emit
+        # nothing in the second after an outage, which is luck, not behaviour.
         observation_s = settings.window.observation_s
+        tolerated_s = observation_s * settings.window.min_valid_frame_ratio
         blackout_start = broken.tracking.time_s[start]
-        blackout_end = broken.tracking.time_s[stop - 1] + observation_s
+        blackout_end = broken.tracking.time_s[stop - 1] + tolerated_s
         offending = [i for i in insights if blackout_start <= i.match_time_s <= blackout_end]
         assert not offending, f"insights emitted from invalid windows: {offending}"
 
