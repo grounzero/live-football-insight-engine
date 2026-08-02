@@ -22,6 +22,7 @@ from football_insights.data import metrica_epts
 from football_insights.data.synthetic import SyntheticMatch, generate_synthetic_match
 from football_insights.domain import AttackDirection, EventType, Team
 from football_insights.errors import DataValidationError
+from tests.support import approx
 
 
 class TestYamlConfigBoundary:
@@ -275,6 +276,11 @@ class TestSyntheticDeterminism:
 
     @staticmethod
     def _fingerprint(match: SyntheticMatch) -> str:
+        """Hash everything the generator produced, positions included.
+
+        Exact, and therefore only meaningful *within one process on one machine*
+        — see :meth:`_stable_fingerprint` for why.
+        """
         digest = hashlib.sha256()
         tracking = match.tracking
         for array in (
@@ -286,27 +292,75 @@ class TestSyntheticDeterminism:
             tracking.ball_xy,
         ):
             digest.update(np.ascontiguousarray(array).tobytes())
-        digest.update(
-            repr(
-                [
-                    (
-                        event.team,
-                        event.type,
-                        event.subtype,
-                        event.period,
-                        event.start_frame,
-                        event.end_frame,
-                        event.start_time_s,
-                        event.end_time_s,
-                        event.start_xy,
-                        event.end_xy,
-                    )
-                    for event in match.events
-                ]
-            ).encode()
-        )
+        digest.update(TestSyntheticDeterminism._event_repr(match))
         digest.update(repr(match.true_entries).encode())
         return digest.hexdigest()
+
+    @staticmethod
+    def _event_repr(match: SyntheticMatch) -> bytes:
+        return repr(
+            [
+                (
+                    event.team,
+                    event.type,
+                    event.subtype,
+                    event.period,
+                    event.start_frame,
+                    event.end_frame,
+                    event.start_time_s,
+                    event.end_time_s,
+                    event.start_xy,
+                    event.end_xy,
+                )
+                for event in match.events
+            ]
+        ).encode()
+
+    @staticmethod
+    def _stable_fingerprint(match: SyntheticMatch) -> str:
+        """Hash only the parts that are bit-identical on every platform.
+
+        The simulated position arrays are deliberately excluded. They are the
+        output of chained floating-point arithmetic, and the last bit of that
+        arithmetic is not portable: identical code on identical numpy produces
+        results differing by an ULP or so between arm64 and x86-64, which is
+        enough to move a SHA-256. Pinning them by hash made this test assert the
+        developer's CPU architecture, and it failed in CI for that reason alone.
+
+        What remains — the clock, the frame index, every event and the
+        ground-truth entries — is integer, RNG-drawn or derived from a frame
+        number, and is exactly reproducible anywhere. It is also where a
+        reordered draw shows up: events carry the waypoint coordinates each
+        sequence was built from, so a change in draw order moves this digest.
+
+        The positions are still covered, by
+        :meth:`test_simulated_positions_match_recorded_statistics`, which
+        compares them numerically instead of bitwise.
+        """
+        digest = hashlib.sha256()
+        tracking = match.tracking
+        for array in (tracking.period, tracking.frame, tracking.time_s):
+            digest.update(np.ascontiguousarray(array).tobytes())
+        digest.update(TestSyntheticDeterminism._event_repr(match))
+        digest.update(repr(match.true_entries).encode())
+        return digest.hexdigest()
+
+    @staticmethod
+    def _position_stats(match: SyntheticMatch) -> list[float]:
+        """Summarise the simulated positions in a way ULP noise cannot move.
+
+        Mean and standard deviation pin where the players and ball are; the mean
+        absolute frame-to-frame change pins how they move, which a change to the
+        step size or the pursuit rule would shift immediately while leaving the
+        first two nearly intact.
+        """
+        tracking = match.tracking
+        out: list[float] = []
+        for array in (tracking.home_xy, tracking.away_xy, tracking.ball_xy):
+            out.append(float(np.nanmean(array)))
+            out.append(float(np.nanstd(array)))
+            out.append(float(np.nanmean(np.abs(np.diff(array, axis=0)))))
+        return out
 
     #: Digests recorded from the generator as it behaved before
     #: `generate_synthetic_match` was split into stages, and re-verified
@@ -320,14 +374,66 @@ class TestSyntheticDeterminism:
     #: If a change to the simulation is intended, update these deliberately and
     #: say so in the pull request: every fixture in the suite shifts with them.
     GOLDEN: ClassVar[dict[int, str]] = {
-        3: "64c012813ff703a4a8bce6a38c74cbd7c19c7bcd54d2058ccae69fb528800404",
-        7: "684407eac878817dacb1251df4cfa36806cc0a139952748b1911834ebe6441b1",
-        17: "b8c2a65a0717e07be2e5337904073bcbf50fbf17b6d5396f218e81fb7e39ce6f",
-        23: "f754d15a0475b2ff3d102918ba0b70b5f211bbaf00045dfd5985bc9aaf09750a",
+        3: "648ff4ee6c71693e19c3dcb58d28f7906d6bf843e8871ac9404febe1436680df",
+        7: "ed9fef36736602ed8aa1a64127a576ad204e9ae191884dd2d065adb772313bea",
+        17: "80c47550287aa82d40613ee00154d9096d2fc61430b1704122197ab7dfb9ba0a",
+        23: "eefb32498dd04c379ce322247b09ec7341e18701c0de8576caa1c810bae951a2",
+    }
+
+    #: Position summaries for the same seeds, verified identical to within
+    #: 2e-16 relative on darwin/arm64 and linux/amd64. The comparison below
+    #: allows 1e-9, which is seven orders of magnitude above the observed
+    #: spread and far below any change a person would make on purpose.
+    GOLDEN_STATS: ClassVar[dict[int, list[float]]] = {
+        3: [
+            -1.5029143307965462,
+            18.493539722232292,
+            0.07442660226746117,
+            -1.1912559019858093,
+            18.504199978698157,
+            0.07777388551879111,
+            -3.689134727015577,
+            14.938456922888632,
+            0.15607918807878854,
+        ],
+        7: [
+            -0.5853952540072361,
+            18.661640806640904,
+            0.07939842304050683,
+            -1.0108324101161152,
+            18.471401079646988,
+            0.07802442899415378,
+            -2.7526884158491423,
+            14.643071321361287,
+            0.15902318636079318,
+        ],
+        17: [
+            1.5700974745065224,
+            19.248275396160892,
+            0.07228343344902555,
+            1.7525994616108727,
+            18.136175368644334,
+            0.0693965405226305,
+            2.7183719643823667,
+            13.64987137972367,
+            0.14341560316538418,
+        ],
+        23: [
+            -0.776718963741653,
+            19.51521502038294,
+            0.06461031056853506,
+            -0.45958472030882513,
+            17.737733517605655,
+            0.06343224816842673,
+            -2.064811367399106,
+            12.803445779399256,
+            0.12475946804263628,
+        ],
     }
 
     @pytest.mark.parametrize("seed", [3, 7, 17, 23])
     def test_the_same_seed_gives_identical_output(self, seed: int) -> None:
+        """Two calls in one process agree down to the last bit, positions included."""
         first = generate_synthetic_match(seed=seed, period_duration_s=45.0)
         second = generate_synthetic_match(seed=seed, period_duration_s=45.0)
         assert self._fingerprint(first) == self._fingerprint(second)
@@ -336,12 +442,19 @@ class TestSyntheticDeterminism:
     def test_output_matches_the_recorded_fingerprint(self, seed: int) -> None:
         """The generator still produces exactly what the fixtures were built on."""
         match = generate_synthetic_match(seed=seed, period_duration_s=45.0)
-        assert self._fingerprint(match) == self.GOLDEN[seed]
+        assert self._stable_fingerprint(match) == self.GOLDEN[seed]
+
+    @pytest.mark.parametrize("seed", [3, 7, 17, 23])
+    def test_simulated_positions_match_recorded_statistics(self, seed: int) -> None:
+        """The simulation still puts players and the ball where it used to."""
+        match = generate_synthetic_match(seed=seed, period_duration_s=45.0)
+        assert self._position_stats(match) == approx(self.GOLDEN_STATS[seed], rel=1e-9)
 
     def test_different_seeds_diverge(self) -> None:
         a = generate_synthetic_match(seed=1, period_duration_s=45.0)
         b = generate_synthetic_match(seed=2, period_duration_s=45.0)
         assert self._fingerprint(a) != self._fingerprint(b)
+        assert self._stable_fingerprint(a) != self._stable_fingerprint(b)
 
     def test_periods_are_contiguous_in_frames_and_time(self) -> None:
         """Frame numbers and timestamps run continuously across the half-time break."""

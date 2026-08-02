@@ -17,9 +17,11 @@ from football_insights.serving.loader import (
     PREFERRED,
     available_matches,
     build_engine,
+    default_match_id,
     load_match,
     load_predictor,
     load_replay,
+    resolve_match_source,
 )
 from football_insights.serving.metrics import Metrics
 
@@ -35,6 +37,7 @@ __all__ = [
     "available_matches",
     "build_engine",
     "create_configured_app",
+    "default_match_id",
     "load_match",
     "load_predictor",
     "load_replay",
@@ -45,7 +48,7 @@ LOGGER = logging.getLogger("football_insights.bootstrap")
 
 def create_configured_app(
     settings: Settings,
-    match_id: str,
+    match_id: str | None = None,
     fault_profile: str = "clean",
     seed: int = 42,
     speed: float = 8.0,
@@ -54,7 +57,8 @@ def create_configured_app(
 
     Args:
         settings: Resolved configuration.
-        match_id: Match to replay.
+        match_id: Match to replay; resolved from configuration and mode when
+            omitted, which in public-demo mode means the generated fixture.
         fault_profile: Fault profile name.
         seed: Fault-injection seed.
         speed: Replay rate.
@@ -62,12 +66,14 @@ def create_configured_app(
     Returns:
         The application, ready to serve.
     """
-    tracking, events, orientation = load_match(settings, match_id)
+    resolved_id = match_id or default_match_id(settings)
+    source = resolve_match_source(settings, resolved_id)
+    tracking, events, orientation = source.load()
     metrics = Metrics()
     predictor = load_predictor(settings)
     engine = build_engine(settings, tracking, events, orientation, predictor, metrics)
     player = ReplayPlayer(
-        match_id=match_id,
+        match_id=resolved_id,
         tracking=tracking,
         profile=settings.fault_profile(fault_profile),
         seed=seed,
@@ -76,7 +82,9 @@ def create_configured_app(
     LOGGER.info(
         "service configured",
         extra={
-            "match_id": match_id,
+            "match_id": resolved_id,
+            "data_source": source.data_source,
+            "public_demo": settings.service.public_demo,
             "fault_profile": fault_profile,
             "seed": seed,
             "speed": speed,
@@ -85,4 +93,4 @@ def create_configured_app(
             "threshold": predictor.metadata.threshold,
         },
     )
-    return create_app(settings, engine, player, metrics)
+    return create_app(settings, engine, player, metrics, data_source=source.data_source)

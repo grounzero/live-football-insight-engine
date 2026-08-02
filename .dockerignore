@@ -1,3 +1,13 @@
+# Build output of `npm run build`, and the reason this file matters most.
+#
+# Without this line a developer who has run `make demo-build` ships whatever
+# their working tree happened to contain, while CI — where the directory does
+# not exist, because it is git-ignored — ships an image with no page at all.
+# Two builds of the same commit producing different images is worse than either
+# outcome. The frontend stage builds it fresh; nothing else may supply it.
+src/football_insights/serving/static/
+demo/.ssr-test/
+
 .venv/
 data/
 artifacts/
@@ -12,3 +22,9 @@ demo/node_modules/
 __pycache__/
 *.pyc
 tests/
+htmlcov/
+.coverage
+.claude/
+docs/
+stubs/
+scripts/

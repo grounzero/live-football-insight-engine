@@ -13,17 +13,26 @@ is trained. A *mismatched* artifact does not fall back: a model whose feature
 schema disagrees with the running code is refused, readiness goes false, and the
 reason is reported. Quietly substituting a different model would be worse than
 not starting.
+
+Where a match *comes from* is a :class:`MatchSource`. There are two: the
+downloaded Metrica sample data, and a fixture generated in memory. The second
+exists so the published container can start with no dataset, no bind mount and
+no network — it is the same canonical ``MatchTracking``/``Event``/``Orientation``
+the parsers produce, not a parallel schema, so everything downstream is unaware
+of the difference. Selection happens once, here, rather than as a mode check
+scattered through the route handlers.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Final, Protocol
 
 import numpy as np
 
-from football_insights.data.acquire import AVAILABLE_MATCHES, MATCHES_BY_ID
-from football_insights.errors import SchemaVersionError
+from football_insights.data.acquire import AVAILABLE_MATCHES, MATCHES_BY_ID, MatchFiles
+from football_insights.errors import DataValidationError, SchemaVersionError
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
 from football_insights.models.heuristic import HeuristicPredictor
 from football_insights.replay.player import ReplayPlayer
@@ -43,21 +52,222 @@ LOGGER = logging.getLogger("football_insights.loader")
 #: Preference order when no predictor is named in configuration.
 PREFERRED = ("gru-temporal", "baseline-gbdt", "baseline-logistic")
 
+#: Identifier for the generated fixture. Named so nobody can mistake it for a
+#: real fixture in a status payload, a log line or the demo's match picker.
+SYNTHETIC_MATCH_ID: Final = "Synthetic_Demo"
+SYNTHETIC_SOURCE_FORMAT: Final = "synthetic"
 
-def available_matches(raw_dir: Path) -> tuple[JsonDict, ...]:
+#: Fixture shape. Eight minutes of play at 25 Hz is roughly a minute of
+#: wall-clock at the demo's default 8x, which is long enough to produce many
+#: penalty-area entries and short enough that a visitor sees the replay loop
+#: rather than wondering whether it is stuck.
+SYNTHETIC_PERIODS: Final = 2
+SYNTHETIC_PERIOD_DURATION_S: Final = 240.0
+
+
+class MatchSource(Protocol):
+    """Where one match's tracking, events and orientation come from."""
+
+    @property
+    def match_id(self) -> str:
+        """Identifier this match is known by."""
+        ...
+
+    @property
+    def data_source(self) -> str:
+        """Coarse provenance, reported by ``/ready`` so the UI can label it."""
+        ...
+
+    def load(self) -> tuple[MatchTracking, tuple[Event, ...], Orientation]:
+        """Produce the match. Blocking; callers on the event loop use a thread."""
+        ...
+
+
+@dataclass(frozen=True, slots=True)
+class MetricaMatchSource:
+    """A match parsed from the downloaded Metrica sample data."""
+
+    settings: Settings
+    match_id: str
+
+    @property
+    def data_source(self) -> str:
+        """Real tracking data, downloaded locally and never redistributed."""
+        return "metrica"
+
+    def load(self) -> tuple[MatchTracking, tuple[Event, ...], Orientation]:
+        """Parse and orient the match.
+
+        Roughly 1.5 seconds, almost all of it parsing two 32 MB tracking files.
+
+        Returns:
+            Tracking, events and orientation.
+
+        Raises:
+            DataValidationError: If the match is not catalogued, or its files
+                have not been downloaded.
+        """
+        from football_insights.data import metrica_csv, metrica_epts
+        from football_insights.data.orientation import infer_orientation
+
+        files = _catalogued(self.match_id)
+        paths = files.paths(self.settings.paths.raw_dir)
+        _require_downloaded(self.match_id, paths)
+
+        declared = None
+        if files.source_format == "metrica_csv":
+            tracking, events = metrica_csv.read_match(paths["home"], paths["away"], paths["events"])
+        else:
+            tracking, events, metadata = metrica_epts.read_match(
+                paths["tracking"], paths["metadata"], paths["events"]
+            )
+            declared = metrica_epts.declared_directions(metadata)
+
+        orientation, home_players, away_players = infer_orientation(
+            tracking,
+            events,
+            self.match_id,
+            declared=declared,
+            overrides=self.settings.direction_overrides,
+            override_reasons=self.settings.direction_override_reasons,
+        )
+        tracking = type(tracking)(
+            period=tracking.period,
+            frame=tracking.frame,
+            time_s=tracking.time_s,
+            home_xy=tracking.home_xy,
+            away_xy=tracking.away_xy,
+            ball_xy=tracking.ball_xy,
+            home_players=home_players,
+            away_players=away_players,
+            frame_rate=tracking.frame_rate,
+        )
+        return tracking, events, orientation
+
+
+@dataclass(frozen=True, slots=True)
+class SyntheticDemoMatchSource:
+    """A deterministic fixture generated in memory.
+
+    Reads nothing and downloads nothing, which is what makes the published
+    container self-contained. Orientation comes from the generator's own ground
+    truth rather than being inferred, because here it is known exactly.
+    """
+
+    seed: int = 42
+    n_periods: int = SYNTHETIC_PERIODS
+    period_duration_s: float = SYNTHETIC_PERIOD_DURATION_S
+    match_id: str = field(default=SYNTHETIC_MATCH_ID, init=False)
+
+    @property
+    def data_source(self) -> str:
+        """Generated, not observed. Surfaced wherever the fixture is named."""
+        return SYNTHETIC_SOURCE_FORMAT
+
+    def load(self) -> tuple[MatchTracking, tuple[Event, ...], Orientation]:
+        """Generate the fixture.
+
+        Returns:
+            Tracking, events and orientation, identical for a given seed.
+        """
+        from football_insights.data.synthetic import generate_synthetic_match
+
+        match = generate_synthetic_match(
+            seed=self.seed,
+            n_periods=self.n_periods,
+            period_duration_s=self.period_duration_s,
+        )
+        return match.tracking, match.events, match.orientation
+
+
+def resolve_match_source(settings: Settings, match_id: str) -> MatchSource:
+    """Choose where a match comes from, by identifier alone.
+
+    Keyed on the id rather than on public-demo mode, so the generated fixture is
+    equally available on a development machine that has never downloaded the
+    dataset, and so public mode changes only *which match is chosen by default*
+    — never the meaning of an explicit request.
+
+    Args:
+        settings: Resolved configuration.
+        match_id: Match to load.
+
+    Returns:
+        The source that can produce it.
+    """
+    if match_id == SYNTHETIC_MATCH_ID:
+        return SyntheticDemoMatchSource(seed=settings.replay.seed)
+    return MetricaMatchSource(settings, match_id)
+
+
+def default_match_id(settings: Settings) -> str:
+    """The match to replay when nobody named one."""
+    if settings.replay.match_id:
+        return settings.replay.match_id
+    return SYNTHETIC_MATCH_ID if settings.service.public_demo else "Sample_Game_2"
+
+
+def _catalogued(match_id: str) -> MatchFiles:
+    """Look up a match, failing with the catalogue rather than a bare KeyError.
+
+    Raises:
+        DataValidationError: If the id is not in the catalogue.
+    """
+    try:
+        return MATCHES_BY_ID[match_id]
+    except KeyError as exc:
+        known = ", ".join([*sorted(MATCHES_BY_ID), SYNTHETIC_MATCH_ID])
+        msg = f"unknown match {match_id!r}; this build knows: {known}"
+        raise DataValidationError(msg) from exc
+
+
+def _require_downloaded(match_id: str, paths: dict[str, Path]) -> None:
+    """Fail before parsing when the dataset is not on disk.
+
+    The service used to discover this several hundred milliseconds into a parse,
+    as a ``FileNotFoundError`` naming one CSV. Startup happens before the port is
+    bound, so that surfaced as a container that exited with a stack trace and no
+    indication that the fix is to run one command.
+
+    Raises:
+        DataValidationError: If any required file is missing.
+    """
+    missing = sorted(str(path) for path in paths.values() if not path.is_file())
+    if missing:
+        msg = (
+            f"match {match_id!r} has not been downloaded: missing {', '.join(missing)}. "
+            "Run `football-insights acquire` to fetch the Metrica sample data, or use "
+            f"the generated fixture {SYNTHETIC_MATCH_ID!r}, which needs no download."
+        )
+        raise DataValidationError(msg)
+
+
+def available_matches(raw_dir: Path, *, public_demo: bool = False) -> tuple[JsonDict, ...]:
     """Every catalogued match, and whether it can actually be replayed.
 
     Availability is a check against the filesystem rather than a lookup in the
-    catalogue. :func:`load_match` reads the raw tracking files, so a match this
-    build knows about but has never downloaded is not playable, and offering it
-    in a selector would produce a 1.5-second load ending in a stack trace.
+    catalogue. Loading reads the raw tracking files, so a match this build knows
+    about but has never downloaded is not playable, and offering it in a selector
+    would produce a 1.5-second load ending in a stack trace.
 
     Args:
         raw_dir: Directory the dataset was downloaded into.
+        public_demo: When set, report only the generated fixture. A hosted demo
+            has no dataset and cannot switch match, so listing three Metrica
+            matches — all of them unavailable — would advertise capability the
+            deployment does not have.
 
     Returns:
-        One entry per catalogued match, in catalogue order.
+        One entry per playable match, in catalogue order.
     """
+    if public_demo:
+        return (
+            {
+                "id": SYNTHETIC_MATCH_ID,
+                "source_format": SYNTHETIC_SOURCE_FORMAT,
+                "available": True,
+            },
+        )
     return tuple(
         {
             "id": match.match_id,
@@ -66,6 +276,64 @@ def available_matches(raw_dir: Path) -> tuple[JsonDict, ...]:
         }
         for match in AVAILABLE_MATCHES
     )
+
+
+def _load_named(registry: Path, name: str) -> Predictor | None:
+    """Load one named artifact in preference order, or ``None`` if absent.
+
+    ``.pt`` is tried first so a development machine with both a checkpoint and
+    an export keeps serving the checkpoint, exactly as before. ``.onnx`` is last
+    and is what the published container actually uses: it ships no PyTorch, so
+    the checkpoint branch is skipped and the exported graph is scored through
+    ONNX Runtime.
+
+    Args:
+        registry: Directory holding the artifacts.
+        name: Artifact base name.
+
+    Returns:
+        The predictor, or ``None`` when no artifact of that name exists.
+    """
+    torch_path = registry / f"{name}.pt"
+    if torch_path.is_file():
+        try:
+            from football_insights.models.temporal import TemporalPredictor
+        except ImportError:
+            # Not an error: the base install omits torch on purpose, and an
+            # export of the same model may sit right beside this checkpoint.
+            LOGGER.info(
+                "torch is not installed; skipping checkpoint",
+                extra={"model": name, "path": str(torch_path)},
+            )
+        else:
+            return TemporalPredictor.load(torch_path)
+
+    pickle_path = registry / f"{name}.pkl"
+    if pickle_path.is_file():
+        from football_insights.models.baseline import BaselinePredictor
+
+        return BaselinePredictor.load(pickle_path)
+
+    onnx_path = registry / f"{name}.onnx"
+    if onnx_path.is_file():
+        from football_insights.models.base import ModelMetadata
+        from football_insights.models.onnx_predictor import OnnxPredictor
+
+        metadata_path = registry / f"{name}.metadata.json"
+        if not metadata_path.is_file():
+            # An ONNX graph carries no threshold, no schema hash and no
+            # provenance, so serving one without its sidecar would mean
+            # inventing all three.
+            msg = (
+                f"{onnx_path} has no metadata at {metadata_path.name}; refusing to serve a "
+                "model whose feature schema and decision threshold are unknown"
+            )
+            raise DataValidationError(msg)
+        metadata = ModelMetadata.read(metadata_path)
+        metadata.require_schema(DEFAULT_FEATURE_SPEC.schema_hash)
+        return OnnxPredictor(onnx_path, metadata)
+
+    return None
 
 
 def load_predictor(settings: Settings) -> Predictor:
@@ -78,10 +346,11 @@ def load_predictor(settings: Settings) -> Predictor:
         A predictor. The rule-based fallback is returned when no trained
         artifact is available, with ``is_ml`` false so nothing downstream can
         present it as a model.
-    """
-    from football_insights.models.baseline import BaselinePredictor
-    from football_insights.models.temporal import TemporalPredictor
 
+    Raises:
+        SchemaVersionError: If an artifact was built against a different
+            feature schema.
+    """
     registry = settings.paths.registry_dir
     names: list[str] = (
         [settings.model.model_name]
@@ -90,21 +359,16 @@ def load_predictor(settings: Settings) -> Predictor:
     )
 
     for name in names:
-        torch_path = registry / f"{name}.pt"
-        pickle_path = registry / f"{name}.pkl"
         try:
-            if torch_path.is_file():
-                predictor = TemporalPredictor.load(torch_path)
-            elif pickle_path.is_file():
-                predictor = BaselinePredictor.load(pickle_path)  # type: ignore[assignment]
-            else:
-                continue
+            predictor = _load_named(registry, name)
         except SchemaVersionError:
             # Do not fall through to another model: a schema mismatch means the
             # feature code has changed under a trained artifact, and the right
             # response is to report it, not to silently serve something else.
             LOGGER.exception("refusing model with mismatched feature schema", extra={"model": name})
             raise
+        if predictor is None:
+            continue
         LOGGER.info("loaded model", extra={"model": name, "is_ml": predictor.metadata.is_ml})
         return predictor
 
@@ -118,11 +382,11 @@ def load_predictor(settings: Settings) -> Predictor:
 def load_match(
     settings: Settings, match_id: str
 ) -> tuple[MatchTracking, tuple[Event, ...], Orientation]:
-    """Parse and orient one match for replay.
+    """Load one match for replay, from wherever it comes from.
 
-    Blocking and not cheap — roughly 1.5 seconds per match, almost all of it
-    parsing two 32 MB tracking files. Callers on the event loop must run this in
-    a worker thread.
+    Blocking and, for Metrica data, not cheap — roughly 1.5 seconds per match,
+    almost all of it parsing two 32 MB tracking files. Callers on the event loop
+    must run this in a worker thread.
 
     Args:
         settings: Resolved configuration.
@@ -131,40 +395,7 @@ def load_match(
     Returns:
         Tracking, events and orientation.
     """
-    from football_insights.data import metrica_csv, metrica_epts
-    from football_insights.data.orientation import infer_orientation
-
-    files = MATCHES_BY_ID[match_id]
-    paths = files.paths(settings.paths.raw_dir)
-    declared = None
-    if files.source_format == "metrica_csv":
-        tracking, events = metrica_csv.read_match(paths["home"], paths["away"], paths["events"])
-    else:
-        tracking, events, metadata = metrica_epts.read_match(
-            paths["tracking"], paths["metadata"], paths["events"]
-        )
-        declared = metrica_epts.declared_directions(metadata)
-
-    orientation, home_players, away_players = infer_orientation(
-        tracking,
-        events,
-        match_id,
-        declared=declared,
-        overrides=settings.direction_overrides,
-        override_reasons=settings.direction_override_reasons,
-    )
-    tracking = type(tracking)(
-        period=tracking.period,
-        frame=tracking.frame,
-        time_s=tracking.time_s,
-        home_xy=tracking.home_xy,
-        away_xy=tracking.away_xy,
-        ball_xy=tracking.ball_xy,
-        home_players=home_players,
-        away_players=away_players,
-        frame_rate=tracking.frame_rate,
-    )
-    return tracking, events, orientation
+    return resolve_match_source(settings, match_id).load()
 
 
 def build_engine(

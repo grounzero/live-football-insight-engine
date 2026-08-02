@@ -252,6 +252,46 @@ def prepare_match(
         frame_rate=tracking.frame_rate,
     )
 
+    return prepare_parsed_match(
+        match_id,
+        tracking,
+        events,
+        orientation,
+        settings,
+        validation=report.to_dict(),
+        spec=spec,
+    )
+
+
+def prepare_parsed_match(
+    match_id: str,
+    tracking: MatchTracking,
+    events: tuple[Event, ...],
+    orientation: Orientation,
+    settings: Settings,
+    *,
+    validation: JsonDict | None = None,
+    spec: FeatureSpec = DEFAULT_FEATURE_SPEC,
+) -> PreparedMatch:
+    """Feature-ise and label a match that is already parsed and oriented.
+
+    Split out of :func:`prepare_match` so a match that never came from a file —
+    the generated fixture the demo model is trained on — reaches the modelling
+    stage through exactly the same code, rather than through a second
+    implementation that could drift from this one.
+
+    Args:
+        match_id: Match identifier.
+        tracking: Parsed tracking, with goalkeepers already resolved.
+        events: Parsed events.
+        orientation: Attacking direction per period and team.
+        settings: Resolved configuration.
+        validation: Validation report, when the caller ran one.
+        spec: Feature schema.
+
+    Returns:
+        The prepared match.
+    """
     view = CausalEventView(events, tracking.frame_rate)
     dead_ball = view.dead_ball_frames(tracking.n_frames)
     possession = _possession_codes(view, tracking.frame)
@@ -274,7 +314,7 @@ def prepare_match(
         features=features,
         labels=labels,
         orientation=orientation,
-        validation=report.to_dict(),
+        validation=validation if validation is not None else {},
         frame_rate=tracking.frame_rate,
     )
 

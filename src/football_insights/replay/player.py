@@ -93,11 +93,23 @@ class ReplayPlayer:
         #: can invalidate it — see :meth:`_drop_anchor`.
         self._origin: float | None = None
         self._started = 0.0
+        self._laps = 0
 
     @property
     def total_frames(self) -> int:
         """Number of frames the replay will emit."""
         return len(self._emitted)
+
+    @property
+    def laps(self) -> int:
+        """How many times a looping replay has wrapped back to the first frame.
+
+        A counter rather than something the consumer infers from frame numbers,
+        because a fault profile is allowed to reorder frames: a comparison
+        against the previous frame index would read a reordering as a wrap and
+        tear down rolling state in the middle of a half.
+        """
+        return self._laps
 
     @property
     def summary(self) -> FaultSummary:
@@ -184,6 +196,10 @@ class ReplayPlayer:
                 if not loop:
                     break
                 self.reset()
+                # Consumers rebuild their own rolling state from this; see
+                # `run_replay`, which resets the engine before the first frame
+                # of the new lap so it is not rejected as out of order.
+                self._laps += 1
 
             if self._paused:
                 await asyncio.sleep(0.05)

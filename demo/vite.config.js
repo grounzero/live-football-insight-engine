@@ -19,6 +19,11 @@ export default defineConfig({
       '/metrics': 'http://127.0.0.1:8000',
       '/insights': 'http://127.0.0.1:8000',
       '/replay': 'http://127.0.0.1:8000',
+      // Without these two the pipeline panel is unreachable under `npm run dev`
+      // and the status block never learns which surfaces exist, so the dev
+      // server silently renders a different page from the built one.
+      '/capabilities': 'http://127.0.0.1:8000',
+      '/jobs': 'http://127.0.0.1:8000',
     },
   },
 })

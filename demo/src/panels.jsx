@@ -4,7 +4,55 @@
  * `diagnostics.jsx`, so each reader's surface is one file.
  */
 
-import { BAND_COPY, bandFor, readinessOf, suppressionLabel, trendOf } from './format.js'
+import {
+  BAND_COPY,
+  bandFor,
+  readinessOf,
+  runtimeSummary,
+  suppressionLabel,
+  trendOf,
+} from './format.js'
+
+/**
+ * What this deployment actually is, in four lines.
+ *
+ * Every value comes from `/ready` rather than from copy written here, so the
+ * page cannot claim something the running service is not doing. That matters
+ * most for the two facts a viewer would otherwise assume wrongly: the hosted
+ * replay is a fixture this project generates, and the model scoring it was
+ * trained on that fixture rather than on the real matches the README reports.
+ *
+ * A compact block rather than a banner across the page. The disclosure has to
+ * be present and legible, and it does not have to be the loudest thing on a
+ * screen whose subject is the pitch.
+ */
+export function RuntimeStatus({ runtime }) {
+  const summary = runtimeSummary(runtime)
+  if (summary === null) return null
+  return (
+    <dl className="runtime-status" aria-label="What this deployment is running">
+      <div>
+        <dt>Mode</dt>
+        <dd>{summary.mode}</dd>
+      </div>
+      <div>
+        <dt>Data</dt>
+        <dd className={summary.dataIsSynthetic ? 'warn' : undefined}>{summary.data}</dd>
+      </div>
+      <div>
+        <dt>Predictor</dt>
+        <dd className={summary.predictorIsMl === false ? 'warn' : undefined}>
+          {summary.predictor}
+          {summary.predictorName ? ` — ${summary.predictorName}` : ''}
+        </dd>
+      </div>
+      <div>
+        <dt>Replay</dt>
+        <dd>{summary.replay}</dd>
+      </div>
+    </dl>
+  )
+}
 
 /**
  * Which match is on, and a way to change it.

@@ -19,18 +19,27 @@ from typing import TYPE_CHECKING, Any, Protocol, cast
 import pytest
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Iterator, Mapping, Sequence
     from contextlib import AbstractContextManager
 
     from fastapi.testclient import TestClient
 
 
-def approx(expected: float, *, rel: float | None = None, abs: float | None = None) -> Any:
+def approx(
+    expected: float | Sequence[float],
+    *,
+    rel: float | None = None,
+    abs: float | None = None,
+) -> Any:
     """``pytest.approx`` with a typed signature.
 
     pytest ships ``py.typed`` but leaves ``approx`` itself unannotated, so every
     call site reads as partially unknown. The return stays ``Any`` because the
     real object is a comparison proxy, not a float.
+
+    Sequences are accepted as well as scalars: ``approx`` compares them
+    element-wise, which is how a set of recorded statistics is checked without
+    writing one assertion per number.
     """
     return pytest.approx(expected, rel=rel, abs=abs)  # pyright: ignore[reportUnknownMemberType]
 

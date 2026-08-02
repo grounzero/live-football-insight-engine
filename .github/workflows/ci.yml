@@ -170,8 +170,12 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: demo/package.json
-      - run: npm install
+          # The lockfile, not the manifest: keying the cache on package.json
+          # reuses a tree resolved from a different lockfile.
+          cache-dependency-path: demo/package-lock.json
+      # `npm ci`, not `npm install`: the lockfile is committed and must be the
+      # thing that decides what gets built.
+      - run: npm ci
         working-directory: demo
       - run: npm run build
         working-directory: demo
@@ -182,10 +186,11 @@ jobs:
         working-directory: demo
 
   container:
-    name: Build the container
+    name: Build and smoke-test the container
     runs-on: ubuntu-latest
-    # This job is the only verification the image gets: it has never been built
-    # on the development machine, which has no Docker daemon. Stated in README.
+    # The image is what actually gets deployed, so this job starts it and drives
+    # the running service rather than checking that a CLI command prints
+    # something. Everything it asserts was previously assumed.
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -198,5 +203,15 @@ jobs:
           tags: football-insights:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: Check the CLI responds inside the image
-        run: docker run --rm football-insights:ci info
+      # No mounts, no dataset, a non-default port, and a bounded wait on every
+      # step. The script dumps container logs itself on any failure.
+      - name: Smoke-test the running container
+        run: ./scripts/container-smoke.sh
+        env:
+          IMAGE: football-insights:ci
+          SMOKE_PORT: "8087"
+      # Belt and braces: the script's own trap prints logs, but a failure in the
+      # step above (or a runner kill) should not lose them.
+      - name: Container logs
+        if: failure()
+        run: docker ps -a --format '{{.Names}}' | xargs -r -I{} sh -c 'echo "== {}"; docker logs {} 2>&1 | tail -n 200'

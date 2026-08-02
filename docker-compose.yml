@@ -1,8 +1,14 @@
 # Local single-service setup. Deliberately not a microservice fan-out: nothing
 # here would demonstrate a capability that one container does not.
 #
-# The dataset is mounted rather than baked in — it carries no redistribution
-# licence, so it must not end up in an image layer.
+# This runs the image the way a *developer* runs it — against the real Metrica
+# sample data, mounted rather than baked in, because that data carries no
+# redistribution licence and must not end up in an image layer.
+#
+# The published container runs the other way, and needs none of this: no mounts,
+# no dataset, a generated fixture and a read-only replay. Those defaults are
+# baked into the image, so a bare `docker run -p 8000:8000 <image>` is the
+# hosted demo. See README "Public demo deployment".
 
 services:
   insight-engine:
@@ -16,5 +22,11 @@ services:
     environment:
       FI_SERVICE__LOG_LEVEL: INFO
       FI_REPLAY__SPEED: "8"
-    command: ["serve", "--match", "Sample_Game_2", "--speed", "8"]
+      # Undo the image's hosted-demo defaults: real data, real registry, and the
+      # replay controls the local demo's transport needs.
+      FI_SERVICE__PUBLIC_DEMO: "0"
+      FI_REPLAY__LOOP: "0"
+      FI_PATHS__REGISTRY_DIR: /app/artifacts/registry
+      FI_MODEL__MODEL_NAME: ""
+    command: ["football-insights", "serve", "--match", "Sample_Game_2", "--speed", "8"]
     restart: unless-stopped

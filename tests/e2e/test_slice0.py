@@ -27,6 +27,7 @@ from football_insights.models.heuristic import HeuristicPredictor
 from football_insights.replay.player import ReplayPlayer
 from football_insights.serving.app import create_app
 from football_insights.serving.engine import InsightEngine
+from football_insights.serving.messages import StreamMessage
 from football_insights.serving.metrics import Metrics
 from football_insights.serving.state import AppState
 from football_insights.serving.stream import SUPPRESSION_ROLLUP_FRAMES
@@ -304,11 +305,11 @@ class TestReplayRestart:
         return int(rollup["emitted"]) + sum(counts.values())
 
     @staticmethod
-    async def _drain(queue: asyncio.Queue[str], count: int) -> list[JsonDict]:
+    async def _drain(queue: asyncio.Queue[StreamMessage], count: int) -> list[JsonDict]:
         out: list[JsonDict] = []
         while len(out) < count:
-            raw = await asyncio.wait_for(queue.get(), timeout=10.0)
-            out.append(json.loads(raw))
+            message = await asyncio.wait_for(queue.get(), timeout=10.0)
+            out.append(json.loads(message.data))
         return out
 
     async def test_restart_rebuilds_engine_state(self, settings: Settings) -> None:

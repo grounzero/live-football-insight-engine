@@ -24,6 +24,15 @@ class OrientationError(DataValidationError):
     """
 
 
+class ConfigurationError(FootballInsightsError):
+    """The service was asked to start with settings it cannot honour.
+
+    Raised before anything is bound or loaded, so a misconfigured deployment
+    fails at startup with a readable message rather than binding a port nobody
+    expected or serving with a contradictory combination of flags.
+    """
+
+
 class SchemaVersionError(FootballInsightsError):
     """A model artifact was built against an incompatible feature schema."""
 

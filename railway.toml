@@ -1,0 +1,37 @@
+# Railway deployment for the public demo.
+#
+# The Dockerfile is the source of truth: every hosted-demo default — generated
+# fixture, read-only looping replay, ONNX demo model, bind on all interfaces —
+# is baked into the image. So this file sets no environment variables and no
+# start command, and a deploy needs nothing configured in the dashboard.
+# Railway injects PORT; `serve` reads it above every other configuration layer.
+#
+# See README "Public demo deployment" for the walkthrough and for what the
+# hosted demo does and does not claim.
+
+[build]
+builder = "DOCKERFILE"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# One replica, and not an arbitrary default. The replay, its subscriber set and
+# the Prometheus registry all live in one process, so a second instance would
+# serve a second, divergent replay from the same URL — two visitors could watch
+# different minutes of the "same" match. Scaling out needs shared replay state
+# first; see the README's stateful-demo note.
+numReplicas = 1
+
+# `/ready`, not `/health`, because this gates whether traffic is routed here.
+# It answers 503 until a predictor is loaded, the fixture is playable and the
+# built page is present, so a container that came up without its UI is never
+# put in front of a visitor. It is deliberately true before anyone has
+# connected — the replay starts on the first viewer, and gating on an active
+# replay would mean this check could never pass. Docker's own HEALTHCHECK stays
+# on `/health`, which is liveness and must not depend on any of that.
+healthcheckPath = "/ready"
+healthcheckTimeout = 300
+
+# The build trains a small model and can take a few minutes on a cold cache;
+# a crash loop from a transient failure should back off rather than hammer.
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10

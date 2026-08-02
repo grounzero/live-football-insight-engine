@@ -125,7 +125,7 @@ class TestMatchSwitchRoute:
     ) -> tuple[ApiClient, AppState]:
         engine, player, metrics = _build(match, settings)
 
-        def fake_catalogue(_: Path) -> tuple[JsonDict, ...]:
+        def fake_catalogue(_: Path, *, public_demo: bool = False) -> tuple[JsonDict, ...]:
             return (
                 {"id": "Sample_Game_1", "source_format": "metrica_csv", "available": True},
                 {"id": "Sample_Game_3", "source_format": "metrica_epts", "available": False},
@@ -245,7 +245,7 @@ class TestSwapMechanics:
         await asyncio.sleep(0.05)
         await state.stop_replay_task()
 
-        published = [json.loads(queue.get_nowait()) for _ in range(queue.qsize())]
+        published = [json.loads(queue.get_nowait().data) for _ in range(queue.qsize())]
         assert published, "the loop should have published something before being stopped"
         assert not any(message["type"] == "end" for message in published)
 
@@ -260,7 +260,7 @@ class TestSwapMechanics:
             await asyncio.sleep(0.02)
             if not state.has_subscribers:  # pragma: no cover - defensive
                 break
-            drained = [json.loads(queue.get_nowait()) for _ in range(queue.qsize())]
+            drained = [json.loads(queue.get_nowait().data) for _ in range(queue.qsize())]
             if any(message["type"] == "end" for message in drained):
                 return
         pytest.fail("the replay never published an end marker")
@@ -286,7 +286,11 @@ class TestPipelineGate:
     def test_capabilities_reports_the_gate(self, match: SyntheticMatch, settings: Settings) -> None:
         engine, player, metrics = _build(match, settings)
         client = ApiClient(TestClient(create_app(settings, engine, player, metrics)))
-        assert client.get("/capabilities").json() == {"pipeline_controls": False}
+        assert client.get("/capabilities").json() == {
+            "pipeline_controls": False,
+            "replay_controls": True,
+            "public_demo": False,
+        }
 
     def test_the_routes_are_absent_when_disabled(self, settings: Settings) -> None:
         application = create_app(settings)
@@ -298,7 +302,11 @@ class TestPipelineGate:
         application = create_app(settings)
         assert "/jobs" in application.openapi()["paths"]
         client = ApiClient(TestClient(application))
-        assert client.get("/capabilities").json() == {"pipeline_controls": True}
+        assert client.get("/capabilities").json() == {
+            "pipeline_controls": True,
+            "replay_controls": True,
+            "public_demo": False,
+        }
         listing = client.get("/jobs").json()
         assert [stage["name"] for stage in listing["stages"]] == [
             "data",

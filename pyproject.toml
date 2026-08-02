@@ -25,10 +25,7 @@ dependencies = [
     "numpy>=2.1,<3",
     "pandas>=2.2,<4",
     "scikit-learn>=1.5,<2",
-    "torch>=2.4,<3",
-    "onnx>=1.17,<2",
     "onnxruntime>=1.19,<2",
-    "onnxscript>=0.1",
     "fastapi>=0.115,<1",
     "uvicorn[standard]>=0.30,<1",
     "pydantic>=2.9,<3",
@@ -42,7 +39,20 @@ dependencies = [
 
 [project.optional-dependencies]
 tracking = ["mlflow>=2.16,<4"]
+# Training and ONNX *export*. Serving needs neither: it scores through
+# onnxruntime, which is a core dependency. Keeping torch out of the base
+# install is what lets the published container ship without ~800 MB of
+# framework it would never call — see the runtime stage in the Dockerfile.
+# Every import of these lives inside a function body, so a base install still
+# imports `football_insights` cleanly and fails only if a training command is
+# actually invoked.
+train = [
+    "torch>=2.4,<3",
+    "onnx>=1.17,<2",
+    "onnxscript>=0.1",
+]
 dev = [
+    "football-insights[train]",
     # >=9.0.3: 8.x is affected by PYSEC-2026-1845, and the previous `<9` cap
     # made the fixed release uninstallable.
     "pytest>=9.0.3,<10",
@@ -74,11 +84,13 @@ football_insights = ["py.typed"]
 # would never show the demo the README points at. Asset filenames are
 # content-hashed by vite and change on every build, hence the glob.
 #
-# `static/*.svg` covers vite's `public/` passthrough, which lands at the root of
-# the output rather than under `assets/`: the favicon is content-addressed by
-# neither name nor hash, so without this line the wheel ships a page that asks
-# for an icon it does not contain.
-"football_insights.serving" = ["static/index.html", "static/assets/*", "static/*.svg"]
+# `static/**/*` rather than an enumerated list: vite's `public/` passthrough
+# lands at the root of the output rather than under `assets/`, and a future
+# build that nests assets one directory deeper would otherwise be dropped from
+# the wheel silently. The container build asserts `serving/static/index.html` is
+# present inside the built wheel, so an empty match fails the build rather than
+# producing an image that serves the API and 404s the page.
+"football_insights.serving" = ["static/**/*"]
 
 # ---------------------------------------------------------------- ruff
 [tool.ruff]

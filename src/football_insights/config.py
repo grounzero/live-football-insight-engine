@@ -1,8 +1,19 @@
 """Typed configuration.
 
-Every tunable lives here. Values resolve in three layers, later overriding
-earlier: dataclass defaults, an optional YAML file, then environment variables
-prefixed ``FI_`` with ``__`` as the nesting delimiter (``FI_WINDOW__HORIZON_S=7``).
+Every tunable lives here. Values come from three layers: model defaults,
+environment variables prefixed ``FI_`` with ``__`` as the nesting delimiter
+(``FI_WINDOW__HORIZON_S=7``), and an optional YAML file.
+
+Note the precedence carefully, because it is not the obvious one: a YAML file is
+passed to the model as init keyword arguments, and pydantic-settings ranks init
+arguments *above* environment variables. So a key present in ``--config`` wins
+over the matching ``FI_`` variable. That is long-standing behaviour and every
+CLI command depends on it, so it is documented rather than changed here.
+
+The bind address is the one place that would be actively dangerous to leave to
+that ordering — a hosting platform injects ``PORT`` and expects to be obeyed —
+so :func:`resolve_port` and :func:`resolve_host` sit above all three layers and
+are the only place in the package that reads those variables.
 
 The episode-grouping and threshold knobs are load-bearing for reported results,
 so :meth:`Settings.fingerprint` hashes the whole resolved configuration into
@@ -13,15 +24,29 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 import yaml
 from pydantic import BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from football_insights.errors import ConfigurationError
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
 PredictorKind = Literal["heuristic", "logistic", "gbdt", "gru"]
 InferenceBackend = Literal["torch", "onnx"]
+
+#: Platform-injected listen port. Railway, Fly, Heroku and Cloud Run all set
+#: this and route to whatever it names; a service that ignores it is
+#: unreachable no matter how healthy it is.
+PORT_ENV_VAR: Final = "PORT"
+
+MIN_PORT: Final = 1
+MAX_PORT: Final = 65535
 
 
 def _parse_yaml_mapping(text: str, source: Path) -> dict[str, Any]:
@@ -215,6 +240,15 @@ class ServiceSettings(BaseModel):
     #: the published container, so turning it on is a deliberate act:
     #: ``serve --dev-tools`` or ``FI_SERVICE__ENABLE_PIPELINE_CONTROLS=1``.
     enable_pipeline_controls: bool = False
+    #: Run as a hosted public demo: a generated synthetic fixture instead of
+    #: Metrica data, and a read-only replay.
+    #:
+    #: Replay state is process-wide — one visitor pausing the match pauses it
+    #: for everyone watching — so on a public URL the mutating replay routes are
+    #: not registered at all, exactly as ``enable_pipeline_controls`` withholds
+    #: the job routes. Off by default: turning it on is a deliberate act, via
+    #: ``serve --public-demo`` or ``FI_SERVICE__PUBLIC_DEMO=1``.
+    public_demo: bool = False
 
 
 class Settings(BaseSettings):
@@ -331,3 +365,79 @@ class Settings(BaseSettings):
 def default_settings() -> Settings:
     """Settings with every default in place, used by tests and the demo."""
     return Settings()
+
+
+def resolve_port(
+    explicit: int | None,
+    settings: Settings,
+    env: Mapping[str, str] | None = None,
+) -> int:
+    """Decide which port to listen on.
+
+    Precedence, highest first:
+
+    1. ``explicit`` — the ``--port`` option, an operator saying so directly;
+    2. ``PORT`` — the hosting platform, which routes to this and nothing else;
+    3. ``settings.service.port`` — ``FI_SERVICE__PORT`` or a YAML file;
+    4. the model default, 8000.
+
+    ``PORT`` sits above the ``FI_``-prefixed layer deliberately. A platform that
+    injects it will send traffic there regardless of what the image was built
+    with, so honouring a baked-in ``FI_SERVICE__PORT`` instead would produce a
+    container that looks healthy and is unreachable.
+
+    Args:
+        explicit: Value passed on the command line, if any.
+        settings: Resolved configuration.
+        env: Environment to read; the real one when omitted.
+
+    Returns:
+        A port between 1 and 65535.
+
+    Raises:
+        ConfigurationError: If ``explicit`` or ``PORT`` is out of range, or
+            ``PORT`` is not an integer.
+    """
+    if explicit is not None:
+        return _validated_port(explicit, source="--port")
+
+    raw = (env if env is not None else os.environ).get(PORT_ENV_VAR)
+    if raw is not None and raw.strip():
+        try:
+            parsed = int(raw.strip())
+        except ValueError as exc:
+            msg = (
+                f"{PORT_ENV_VAR}={raw!r} is not an integer. It is set by the hosting "
+                "platform and must name a TCP port."
+            )
+            raise ConfigurationError(msg) from exc
+        return _validated_port(parsed, source=PORT_ENV_VAR)
+
+    # Already validated by the ge/le bounds on ServiceSettings.port.
+    return settings.service.port
+
+
+def _validated_port(value: int, source: str) -> int:
+    """Bounds-check a port, naming where it came from."""
+    if not MIN_PORT <= value <= MAX_PORT:
+        msg = f"{source}={value} is outside the valid port range {MIN_PORT}-{MAX_PORT}"
+        raise ConfigurationError(msg)
+    return value
+
+
+def resolve_host(explicit: str | None, settings: Settings) -> str:
+    """Decide which interface to bind.
+
+    ``--host`` wins, then ``settings.service.host`` — which the container image
+    sets to ``0.0.0.0`` through ``FI_SERVICE__HOST``, because the loopback
+    default that is right on a development machine makes a container
+    unreachable from outside itself.
+
+    Args:
+        explicit: Value passed on the command line, if any.
+        settings: Resolved configuration.
+
+    Returns:
+        The interface to bind.
+    """
+    return explicit if explicit is not None else settings.service.host

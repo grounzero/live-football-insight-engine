@@ -119,8 +119,8 @@ function mergeInsights(existing, incoming) {
  */
 export function useServiceStatus() {
   const model = useModelMetadata()
-  const { ready, readyReason } = useReadiness()
-  return { model, ready, readyReason }
+  const { ready, readyReason, runtime } = useReadiness()
+  return { model, ready, readyReason, runtime }
 }
 
 /** Retried until it answers, then left alone: it cannot change while we run. */
@@ -145,18 +145,33 @@ function useModelMetadata() {
   return model
 }
 
-/** Polled for as long as the page is open, because it can flip either way. */
+/**
+ * Polled for as long as the page is open, because it can flip either way.
+ *
+ * `/ready` also carries what is being served — mode, data provenance, predictor
+ * — and the page takes those from here rather than describing them in its own
+ * copy. A hardcoded "synthetic" label would be a claim the page could not keep:
+ * the same build serves real Metrica tracking locally.
+ */
 function useReadiness() {
   const [ready, setReady] = useState(null)
   const [readyReason, setReadyReason] = useState(null)
+  const [runtime, setRuntime] = useState(null)
 
   useEffect(() => {
     let cancelled = false
     const poll = async () => {
       const response = await fetchJson('/ready')
       if (cancelled || response === null) return
-      setReady(Boolean(response.body?.ready))
-      setReadyReason(response.body?.reason ?? null)
+      const body = response.body ?? {}
+      setReady(Boolean(body.ready))
+      setReadyReason(body.reason ?? null)
+      setRuntime({
+        mode: body.mode ?? null,
+        dataSource: body.data_source ?? null,
+        predictor: body.predictor ?? null,
+        replay: body.replay ?? null,
+      })
     }
     poll()
     const id = setInterval(poll, SERVICE_POLL_MS)
@@ -166,7 +181,7 @@ function useReadiness() {
     }
   }, [])
 
-  return { ready, readyReason }
+  return { ready, readyReason, runtime }
 }
 
 /**

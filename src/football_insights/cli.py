@@ -15,6 +15,7 @@ from typing import Annotated
 import typer
 
 from football_insights.config import Settings
+from football_insights.errors import ConfigurationError
 from football_insights.serving.logging import configure_logging
 
 app = typer.Typer(
@@ -147,6 +148,27 @@ def export(config: ConfigOption = None) -> None:
 
 
 @app.command()
+def demo_model(
+    config: ConfigOption = None,
+    out: Annotated[
+        Path | None,
+        typer.Option(help="Registry directory to write into; the configured one by default."),
+    ] = None,
+    seed: Annotated[int, typer.Option(help="Base seed for fixtures and training.")] = 20260801,
+) -> None:
+    """Train and export the synthetic-data model the public demo serves.
+
+    Needs the ``train`` extra. Run during the container build, not at startup:
+    the artifact is deterministic for a seed, so building it once per image is
+    both cheaper and more reproducible than training on every boot.
+    """
+    from football_insights.models.demo_model import build_demo_model
+
+    settings = _settings(config)
+    _echo_json(build_demo_model(settings, out or settings.paths.registry_dir, seed=seed))
+
+
+@app.command()
 def benchmark(
     config: ConfigOption = None,
     iterations: Annotated[int, typer.Option(help="Timed iterations per configuration.")] = 300,
@@ -231,33 +253,69 @@ def replay(
 @app.command()
 def serve(
     config: ConfigOption = None,
-    match: Annotated[str, typer.Option(help="Match to replay.")] = "Sample_Game_2",
+    match: Annotated[
+        str | None,
+        typer.Option(help="Match to replay; the generated fixture in public-demo mode."),
+    ] = None,
     fault_profile: Annotated[str, typer.Option()] = "clean",
     seed: Annotated[int, typer.Option()] = 42,
     speed: Annotated[float, typer.Option(help="Replay rate; 1.0 is real time.")] = 8.0,
-    host: Annotated[str | None, typer.Option()] = None,
-    port: Annotated[int | None, typer.Option()] = None,
+    host: Annotated[str | None, typer.Option(help="Interface to bind.")] = None,
+    port: Annotated[
+        int | None,
+        typer.Option(help="Port to bind; overrides the PORT environment variable."),
+    ] = None,
     dev_tools: Annotated[
         bool,
         typer.Option(help="Expose the pipeline stages as job endpoints and a panel in the demo."),
     ] = False,
+    public_demo: Annotated[
+        bool,
+        typer.Option(help="Serve a generated fixture with a read-only, looping replay."),
+    ] = False,
 ) -> None:
-    """Start the API and the viewer demo."""
+    """Start the API and the viewer demo.
+
+    Raises:
+        ConfigurationError: If the requested combination of flags cannot be
+            served, or the bind port is invalid.
+    """
     import uvicorn
 
+    from football_insights.config import resolve_host, resolve_port
     from football_insights.serving.bootstrap import create_configured_app
 
     settings = _settings(config)
+    if dev_tools and public_demo:
+        # Refused rather than resolved by precedence. The two flags express
+        # opposite intentions — one opens the pipeline to anyone who can reach
+        # the port, the other assumes anyone can — and silently honouring
+        # either one would be a security decision made by argument order.
+        msg = (
+            "--dev-tools and --public-demo cannot be combined: pipeline controls start "
+            "long, resource-hungry work and this service has no authentication"
+        )
+        raise ConfigurationError(msg)
     if dev_tools:
         # Set here rather than defaulted on, so an operator who did not ask for
         # the pipeline routes never gets them. See ServiceSettings for why.
         settings.service.enable_pipeline_controls = True
+    if public_demo:
+        settings.service.public_demo = True
+
     application = create_configured_app(settings, match, fault_profile, seed, speed)
     uvicorn.run(
         application,
-        host=host or settings.service.host,
-        port=port or settings.service.port,
+        host=resolve_host(host, settings),
+        port=resolve_port(port, settings),
         log_level=settings.service.log_level.lower(),
+        # One worker, stated rather than implied. The replay, its subscriber set
+        # and the Prometheus registry all live in this process, so a second
+        # worker would serve a second, divergent replay from the same URL and
+        # report metrics for whichever one the load balancer happened to pick.
+        # Passing an application instance rather than an import string forecloses
+        # multi-process mode anyway; this makes the reason visible.
+        workers=1,
     )
 
 

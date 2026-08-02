@@ -10,7 +10,6 @@ subject that a reader should not have to find among route handlers.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
@@ -18,6 +17,7 @@ from typing import TYPE_CHECKING, Final
 import numpy as np
 
 from football_insights.serving.logging import new_correlation_id
+from football_insights.serving.messages import StreamMessageType, stream_message
 from football_insights.types import JsonDict
 
 if TYPE_CHECKING:
@@ -143,7 +143,7 @@ def frame_payload(frame: Frame, result: EngineResult, suppression: str | None) -
 def publish_insight(state: AppState, insight: Insight) -> None:
     """Record an emitted insight and fan it out to subscribers."""
     state.recent_insights.append(insight)
-    state.publish(json.dumps({"type": "insight", "payload": insight.to_dict()}))
+    state.publish(stream_message(StreamMessageType.INSIGHT, insight.to_dict()))
     LOGGER.info(
         "insight emitted",
         extra={
@@ -163,7 +163,7 @@ def apply_restart(state: AppState, engine: InsightEngine) -> None:
     """
     engine.reset()
     state.recent_insights.clear()
-    state.publish(json.dumps({"type": "restart", "payload": {}}), critical=True)
+    state.publish(stream_message(StreamMessageType.RESTART, {}), critical=True)
     LOGGER.info("replay restarted")
 
 
@@ -175,7 +175,7 @@ def announce_match(state: AppState, match_id: str, *, loading: bool) -> None:
     that misses the second never stops waiting.
     """
     state.publish(
-        json.dumps({"type": "match", "payload": {"match_id": match_id, "loading": loading}}),
+        stream_message(StreamMessageType.MATCH, {"match_id": match_id, "loading": loading}),
         critical=True,
     )
 
@@ -201,12 +201,10 @@ def _publish_results(
         publish_insight(state, result.outcome.insight)
 
     if rollup.due():
-        state.publish(json.dumps({"type": "suppression", "payload": rollup.drain()}))
+        state.publish(stream_message(StreamMessageType.SUPPRESSION, rollup.drain()))
 
     if publish_frame:
-        state.publish(
-            json.dumps({"type": "frame", "payload": frame_payload(frame, result, reason)})
-        )
+        state.publish(stream_message(StreamMessageType.FRAME, frame_payload(frame, result, reason)))
 
 
 async def run_replay(state: AppState) -> None:
@@ -229,6 +227,7 @@ async def run_replay(state: AppState) -> None:
     publish_every = max(1, round(SOURCE_FRAME_HZ / FRAME_PUBLISH_HZ))
     rollup = SuppressionRollup()
     counter = 0
+    laps = player.laps
     try:
         async for emitted in player.stream(loop=state.settings.replay.loop):
             if state.take_restart():
@@ -241,7 +240,28 @@ async def run_replay(state: AppState) -> None:
                 apply_restart(state, engine)
                 rollup = SuppressionRollup()
                 counter = 0
+                laps = player.laps
                 continue
+
+            if player.laps != laps:
+                # A looping replay has wrapped. Same hazard as a restart, arriving
+                # without anyone asking: the engine's last frame id is at the end
+                # of the match and every frame of the new lap would be dropped as
+                # out of order. Unlike a restart there is no stale frame to
+                # discard — this one is the first frame of the new lap — so the
+                # state is rebuilt and the frame then falls through to be
+                # processed rather than skipped.
+                laps = player.laps
+                apply_restart(state, engine)
+                rollup = SuppressionRollup()
+                counter = 0
+
+            if state.should_stop_unwatched():
+                LOGGER.info(
+                    "no subscribers; stopping the replay until someone connects",
+                    extra={"frames": counter},
+                )
+                return
 
             counter += 1
             _publish_results(
@@ -258,7 +278,5 @@ async def run_replay(state: AppState) -> None:
         # close their stream for good on an end marker, so announcing one during
         # a match swap would present a change of match as the end of the match.
         if state.end_marker_wanted:
-            state.publish(
-                json.dumps({"type": "end", "payload": {"frames": counter}}), critical=True
-            )
+            state.publish(stream_message(StreamMessageType.END, {"frames": counter}), critical=True)
         LOGGER.info("replay finished", extra={"frames": counter})

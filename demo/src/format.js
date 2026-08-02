@@ -89,6 +89,61 @@ export function readinessOf(ready) {
   return ready ? READINESS.ready : READINESS.notReady
 }
 
+/** How the service describes itself, in words a viewer can act on. */
+const MODE_COPY = {
+  public_demo: 'Public demo',
+  local: 'Local',
+}
+
+/**
+ * Where the frames come from.
+ *
+ * The distinction is the point, not a footnote: the hosted demo replays a
+ * fixture this project generates, and presenting that as match data would be
+ * the single most misleading thing this page could do.
+ */
+const DATA_SOURCE_COPY = {
+  synthetic: 'Generated fixture (not real match data)',
+  metrica: 'Metrica sample match',
+  unknown: 'Unknown',
+}
+
+/**
+ * What is actually scoring, by model kind and whether it learned anything.
+ *
+ * `is_ml === false` is the rule-based fallback and says so in as many words.
+ * The trained kinds are labelled by what they are, and the caller adds the
+ * artifact name — nothing here implies the hosted model is the one the README
+ * reports results for.
+ */
+const PREDICTOR_KIND_COPY = {
+  gru: 'Sequence model (GRU)',
+  gbdt: 'Gradient-boosted trees',
+  logistic: 'Logistic regression',
+  heuristic: 'Rule-based fallback',
+}
+
+/**
+ * Runtime facts for the status block, taken from `/ready`.
+ *
+ * Returns `null` until the service has answered, so the block renders once with
+ * real values rather than flashing placeholder text on every load.
+ */
+export function runtimeSummary(runtime) {
+  if (!runtime) return null
+  const predictor = runtime.predictor
+  const kind = predictor ? (PREDICTOR_KIND_COPY[predictor.kind] ?? predictor.kind) : null
+  return {
+    mode: MODE_COPY[runtime.mode] ?? runtime.mode ?? 'Unknown',
+    data: DATA_SOURCE_COPY[runtime.dataSource] ?? runtime.dataSource ?? 'Unknown',
+    dataIsSynthetic: runtime.dataSource === 'synthetic',
+    predictor: predictor === null || predictor === undefined ? 'None loaded' : kind,
+    predictorName: predictor?.name ?? null,
+    predictorIsMl: predictor ? Boolean(predictor.is_ml) : null,
+    replay: runtime.replay ?? 'unknown',
+  }
+}
+
 /**
  * Human wording for each `SuppressionReason` the service can report.
  *

@@ -5,7 +5,8 @@ FI := .venv/bin/football-insights
 TEST_MATCH ?= Sample_Game_2
 
 .PHONY: help setup data prepare train evaluate export benchmark drift serve demo demo-build \
-        test test-fast slice0 lint typecheck pyright format audit check codehealth clean reference
+        demo-model test test-fast slice0 lint typecheck pyright format format-check audit check \
+        codehealth clean reference container container-build container-smoke
 
 help: ## Show available targets
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}'
@@ -43,9 +44,15 @@ serve: ## Start the API and demo on http://127.0.0.1:8000
 	$(FI) serve --match $(TEST_MATCH) --speed 8
 
 demo-build: ## Build the React demo into the package's static directory
-	cd demo && npm install --silent && npm run build
+	# `npm ci`, not `npm install`: the lockfile is committed, and installing
+	# without it lets a local build drift inside the `^` ranges relative to
+	# what CI and the container build resolve.
+	cd demo && npm ci --silent && npm run build
 
 demo: demo-build serve ## Build the demo, then serve it
+
+demo-model: ## Train and export the synthetic-data model the public demo serves
+	$(FI) demo-model
 
 slice0: ## Run the Slice 0 vertical-path acceptance test
 	$(PY) -m pytest tests/e2e/test_slice0.py -q
@@ -58,6 +65,9 @@ test-fast: ## Run everything except tests needing the downloaded dataset
 
 lint: ## Lint with ruff
 	$(PY) -m ruff check src tests
+
+format-check: ## Verify formatting without changing anything
+	$(PY) -m ruff format --check src tests
 
 format: ## Auto-format and fix with ruff
 	$(PY) -m ruff format src tests
@@ -78,7 +88,18 @@ audit: ## Check dependencies for known vulnerabilities
 	# (pip-audit exits 1 on any advisory), and the exit status is not swallowed.
 	$(PY) -m pip_audit --skip-editable
 
-check: lint typecheck pyright test ## Lint, type check and test
+check: lint format-check typecheck pyright test ## Lint, type check and test
+
+# ---------------------------------------------------------------- container
+IMAGE ?= football-insights:deployment-test
+
+container-build: ## Build the deployable image (frontend, model and service)
+	docker build -t $(IMAGE) .
+
+container-smoke: ## Start the built image and drive the live service over HTTP
+	IMAGE=$(IMAGE) ./scripts/container-smoke.sh
+
+container: container-build container-smoke ## Build the image, then smoke-test it
 
 codehealth: ## CodeScene code-health delta (needs the cs CLI and a PAT)
 	./scripts/codescene.sh

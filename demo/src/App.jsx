@@ -10,7 +10,7 @@ import {
 } from './hooks.js'
 import { InsightList } from './insights.jsx'
 import { useCapabilities } from './jobs.js'
-import { Confidence, Header } from './panels.jsx'
+import { Confidence, Header, RuntimeStatus } from './panels.jsx'
 import { PipelinePanel } from './pipeline.jsx'
 import { Transport } from './transport.jsx'
 
@@ -26,7 +26,7 @@ import { Transport } from './transport.jsx'
  * below it, so neither reader pays for the other.
  */
 export default function App() {
-  const { model, ready, readyReason } = useServiceStatus()
+  const { model, ready, readyReason, runtime } = useServiceStatus()
   const stream = useInsightStream()
   const { replay, matches, control, restart, selectMatch, pending, stale, lastSeen } =
     useReplayControl()
@@ -37,6 +37,11 @@ export default function App() {
   const threshold = model?.decision_threshold ?? 0.5
   const switching = pending || Boolean(stream.switchingTo)
   const showPipeline = Boolean(capabilities?.pipeline_controls)
+  // Undefined until `/capabilities` answers, and treated as "yes" until then:
+  // the transport is the normal case, and hiding it during the first moments of
+  // every local page load would be a visible flicker to avoid a wrong guess
+  // that only a public deployment can make.
+  const showTransport = capabilities?.replay_controls !== false
 
   const { onRestart, onSelectMatch } = useReplayActions({
     restart,
@@ -56,7 +61,7 @@ export default function App() {
         readyReason={readyReason}
         showDiagnostics={showDiagnostics}
         onToggleDiagnostics={onToggleDiagnostics}
-        matches={matches}
+        matches={showTransport ? matches : []}
         currentMatch={replay?.match_id ?? null}
         onSelectMatch={onSelectMatch}
         switching={switching}
@@ -66,17 +71,24 @@ export default function App() {
         <section className="pitch-panel">
           <Pitch frame={stream.frame} />
           <Legend />
-          <Transport
-            frame={stream.frame}
-            replay={replay}
-            control={control}
-            restart={onRestart}
-            pending={pending}
-            status={stream.status}
-            stale={stale}
-            lastSeen={lastSeen}
-            switchingTo={stream.switchingTo}
-          />
+          {showTransport ? (
+            <Transport
+              frame={stream.frame}
+              replay={replay}
+              control={control}
+              restart={onRestart}
+              pending={pending}
+              status={stream.status}
+              stale={stale}
+              lastSeen={lastSeen}
+              switchingTo={stream.switchingTo}
+            />
+          ) : (
+            <p className="transport-readonly">
+              Server-controlled replay, looping continuously. Playback controls are disabled on the
+              public demo because every viewer shares one replay.
+            </p>
+          )}
         </section>
 
         <aside aria-label="Live analysis">
@@ -116,8 +128,14 @@ export default function App() {
       {showPipeline && <PipelinePanel />}
 
       <footer>
-        Predictions are estimates over a short horizon, not statements of fact. Not affiliated with
-        any league, broadcaster or data provider.
+        <RuntimeStatus runtime={runtime} />
+        <p>
+          Predictions are estimates over a short horizon, not statements of fact. This is a
+          demonstration of a tracking-data pipeline: it is not an injury, betting, officiating or
+          player-safety system, and must not be used as one. Reported evaluation results were
+          measured on Metrica sample matches and do not describe the model serving this page. Not
+          affiliated with any league, broadcaster or data provider.
+        </p>
       </footer>
     </div>
   )

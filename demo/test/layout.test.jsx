@@ -18,7 +18,7 @@ import test from 'node:test'
 import { renderToStaticMarkup } from 'react-dom/server'
 
 import App from '../src/App.jsx'
-import { Confidence, Header } from '../src/panels.jsx'
+import { Confidence, Header, RuntimeStatus } from '../src/panels.jsx'
 import { Transport } from '../src/transport.jsx'
 import { InsightList } from '../src/insights.jsx'
 import { PipelinePanel } from '../src/pipeline.jsx'
@@ -263,6 +263,65 @@ test('the pipeline panel says what these stages cost before anyone presses one',
 
   assert.match(text, /takes minutes/)
   assert.match(text, /data\/ and artifacts\//)
+})
+
+const SYNTHETIC_RUNTIME = {
+  mode: 'public_demo',
+  dataSource: 'synthetic',
+  predictor: { name: 'demo-synthetic-gru', kind: 'gru', is_ml: true },
+  replay: 'running',
+}
+
+test('the status block renders nothing until the service has answered', () => {
+  // Rendering placeholders would put "Unknown" under every label on each load,
+  // and a viewer reading the page at that moment would be told the wrong thing
+  // about the data rather than nothing at all.
+  assert.equal(render(<RuntimeStatus runtime={null} />), '')
+  assert.equal(render(<RuntimeStatus runtime={undefined} />), '')
+})
+
+test('the status block says generated data is not match data', () => {
+  const text = visibleText(render(<RuntimeStatus runtime={SYNTHETIC_RUNTIME} />))
+
+  assert.match(text, /Public demo/)
+  assert.match(text, /Generated fixture \(not real match data\)/)
+  assert.match(text, /Sequence model \(GRU\) — demo-synthetic-gru/)
+  // The one label that must never appear against a synthetic fixture.
+  assert.doesNotMatch(text, /Metrica/)
+})
+
+test('the status block names the fallback as a fallback', () => {
+  const runtime = {
+    ...SYNTHETIC_RUNTIME,
+    predictor: { name: 'heuristic-fallback', kind: 'heuristic', is_ml: false },
+  }
+  const markup = render(<RuntimeStatus runtime={runtime} />)
+
+  assert.match(visibleText(markup), /Rule-based fallback/)
+  // Flagged, not merely stated: this is the case a reader must not skim past.
+  assert.match(markup, /class="warn"[^>]*>Rule-based fallback/)
+})
+
+test('a real match is labelled as one', () => {
+  const runtime = {
+    mode: 'local',
+    dataSource: 'metrica',
+    predictor: { name: 'gru-temporal', kind: 'gru', is_ml: true },
+    replay: 'running',
+  }
+  const text = visibleText(render(<RuntimeStatus runtime={runtime} />))
+
+  assert.match(text, /Metrica sample match/)
+  assert.doesNotMatch(text, /Generated fixture/)
+})
+
+test('the footer states what this is not', () => {
+  const text = visibleText(render(<App />))
+
+  assert.match(text, /not an injury, betting, officiating or player-safety system/)
+  // The evaluated model and the hosted one are different artifacts, and the
+  // page has to say so where the numbers might otherwise be assumed to apply.
+  assert.match(text, /measured on Metrica sample matches and do not describe the model serving/)
 })
 
 test('no percentage is shown to an audience', () => {

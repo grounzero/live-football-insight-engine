@@ -147,7 +147,10 @@ def validate_tracking(
     _check_frame_ordering(check, report)
     _check_timestamps(check)
 
-    ball_finite: BoolArray = np.isfinite(tracking.ball_xy).all(axis=1)
+    # np.all, not ndarray.all: numpy's stubs before 2.5 type the method's
+    # axis-given overload as `np.bool | NDArray[np.bool]`, which fails a strict
+    # check on the 3.11 leg (2.5 needs 3.12, so 3.11 resolves numpy 2.4).
+    ball_finite: BoolArray = np.all(np.isfinite(tracking.ball_xy), axis=1)
     _check_ball_coverage(check, report, ball_finite, in_play)
     _check_player_positions(check, report)
     _check_ball_positions(check, ball_finite)
@@ -301,7 +304,7 @@ def _check_player_positions(check: _Check, report: ValidationReport) -> None:
     missing_slots = 0
     off_pitch = 0
     for xy in (check.tracking.home_xy, check.tracking.away_xy):
-        finite: BoolArray = np.isfinite(xy).all(axis=2)
+        finite: BoolArray = np.all(np.isfinite(xy), axis=2)
         total_slots += finite.size
         missing_slots += int((~finite).sum())
         on = check.pitch.is_on_pitch(xy, tolerance=OFF_PITCH_TOLERANCE_M)
