@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
+from football_insights.config import resolve_replay_speed
 from football_insights.replay.player import ReplayPlayer
 from football_insights.serving.app import create_app
 from football_insights.serving.loader import (
@@ -51,7 +52,7 @@ def create_configured_app(
     match_id: str | None = None,
     fault_profile: str = "clean",
     seed: int = 42,
-    speed: float = 8.0,
+    speed: float | None = None,
 ) -> FastAPI:
     """Build the fully wired application.
 
@@ -61,11 +62,15 @@ def create_configured_app(
             omitted, which in public-demo mode means the generated fixture.
         fault_profile: Fault profile name.
         seed: Fault-injection seed.
-        speed: Replay rate.
+        speed: Replay rate. ``None`` resolves it from the settings and the mode,
+            so a caller that has no opinion gets the public demo's 4x on a
+            public deployment and the local default elsewhere, rather than
+            whichever number this signature happened to name.
 
     Returns:
         The application, ready to serve.
     """
+    resolved_speed = resolve_replay_speed(speed, settings)
     resolved_id = match_id or default_match_id(settings)
     source = resolve_match_source(settings, resolved_id)
     tracking, events, orientation = source.load()
@@ -77,7 +82,7 @@ def create_configured_app(
         tracking=tracking,
         profile=settings.fault_profile(fault_profile),
         seed=seed,
-        speed=speed,
+        speed=resolved_speed,
     )
     LOGGER.info(
         "service configured",
@@ -87,7 +92,7 @@ def create_configured_app(
             "public_demo": settings.service.public_demo,
             "fault_profile": fault_profile,
             "seed": seed,
-            "speed": speed,
+            "speed": resolved_speed,
             "model": predictor.metadata.name,
             "is_ml": predictor.metadata.is_ml,
             "threshold": predictor.metadata.threshold,

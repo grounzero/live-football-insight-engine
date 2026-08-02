@@ -48,6 +48,24 @@ PORT_ENV_VAR: Final = "PORT"
 MIN_PORT: Final = 1
 MAX_PORT: Final = 65535
 
+#: Replay rate for a hosted public demo.
+#:
+#: Faster than viewing speed on purpose. A visitor gives a demonstration a
+#: minute or two, and the thing being demonstrated is a model that predicts
+#: penalty-area entries — an event that happens a handful of times in a half. At
+#: real time most visitors would leave before the first qualified insight.
+#:
+#: 4x rather than the 8x this shipped with because 8x is past the point where
+#: the motion reads as football at all: players cross the pitch in under two
+#: seconds, and no amount of interpolation makes that look like anything but a
+#: fast-forward.
+PUBLIC_DEMO_REPLAY_SPEED: Final = 4.0
+
+#: Replay rate for a local run. Higher than the public default because a
+#: developer watching their own service is usually waiting for a specific
+#: frame, not watching the football.
+LOCAL_REPLAY_SPEED: Final = 8.0
+
 
 def _parse_yaml_mapping(text: str, source: Path) -> dict[str, Any]:
     """Parse a YAML document into a string-keyed mapping.
@@ -423,6 +441,44 @@ def _validated_port(value: int, source: str) -> int:
         msg = f"{source}={value} is outside the valid port range {MIN_PORT}-{MAX_PORT}"
         raise ConfigurationError(msg)
     return value
+
+
+def resolve_replay_speed(explicit: float | None, settings: Settings) -> float:
+    """Decide how fast to replay.
+
+    Precedence, highest first:
+
+    1. ``explicit`` — the ``--speed`` option, an operator saying so directly;
+    2. ``replay.speed``, but only when it was actually set — ``FI_REPLAY__SPEED``
+       or a YAML file;
+    3. :data:`PUBLIC_DEMO_REPLAY_SPEED` when serving a public demo;
+    4. :data:`LOCAL_REPLAY_SPEED`.
+
+    Step 2 tests ``model_fields_set`` rather than comparing against the field
+    default, which is the only version that behaves correctly at the boundary:
+    ``FI_REPLAY__SPEED=1.0`` is an operator asking for real time, and a
+    comparison against the 1.0 default would read it as "unset" and hand back 4x
+    instead. Pydantic records which keys an input actually carried, so the
+    question can be asked directly.
+
+    Args:
+        explicit: Value passed on the command line, if any.
+        settings: Resolved configuration.
+
+    Returns:
+        A non-negative replay rate; 0 means as fast as possible.
+
+    Raises:
+        ConfigurationError: If ``explicit`` is negative.
+    """
+    if explicit is not None:
+        if explicit < 0:
+            msg = f"--speed={explicit} is negative; use 0 to replay as fast as possible"
+            raise ConfigurationError(msg)
+        return explicit
+    if "speed" in settings.replay.model_fields_set:
+        return settings.replay.speed
+    return PUBLIC_DEMO_REPLAY_SPEED if settings.service.public_demo else LOCAL_REPLAY_SPEED
 
 
 def resolve_host(explicit: str | None, settings: Settings) -> str:

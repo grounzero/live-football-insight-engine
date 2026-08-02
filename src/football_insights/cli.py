@@ -259,7 +259,15 @@ def serve(
     ] = None,
     fault_profile: Annotated[str, typer.Option()] = "clean",
     seed: Annotated[int, typer.Option()] = 42,
-    speed: Annotated[float, typer.Option(help="Replay rate; 1.0 is real time.")] = 8.0,
+    speed: Annotated[
+        float | None,
+        typer.Option(
+            help=(
+                "Replay rate; 1.0 is real time. Defaults to 4x in public-demo mode "
+                "and 8x otherwise, unless replay.speed is configured."
+            )
+        ),
+    ] = None,
     host: Annotated[str | None, typer.Option(help="Interface to bind.")] = None,
     port: Annotated[
         int | None,
@@ -282,7 +290,7 @@ def serve(
     """
     import uvicorn
 
-    from football_insights.config import resolve_host, resolve_port
+    from football_insights.config import resolve_host, resolve_port, resolve_replay_speed
     from football_insights.serving.bootstrap import create_configured_app
 
     settings = _settings(config)
@@ -303,7 +311,11 @@ def serve(
     if public_demo:
         settings.service.public_demo = True
 
-    application = create_configured_app(settings, match, fault_profile, seed, speed)
+    # After the flags above have been folded into `settings`, because the public
+    # demo's default rate is one of the things they decide.
+    application = create_configured_app(
+        settings, match, fault_profile, seed, resolve_replay_speed(speed, settings)
+    )
     uvicorn.run(
         application,
         host=resolve_host(host, settings),

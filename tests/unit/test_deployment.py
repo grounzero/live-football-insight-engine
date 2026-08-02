@@ -23,7 +23,14 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from football_insights.config import Settings, resolve_host, resolve_port
+from football_insights.config import (
+    LOCAL_REPLAY_SPEED,
+    PUBLIC_DEMO_REPLAY_SPEED,
+    Settings,
+    resolve_host,
+    resolve_port,
+    resolve_replay_speed,
+)
 from football_insights.data.synthetic import generate_synthetic_match
 from football_insights.errors import ConfigurationError, DataValidationError
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
@@ -159,6 +166,70 @@ class TestPortResolution:
         settings.service.host = "0.0.0.0"
         assert resolve_host(None, settings) == "0.0.0.0"
         assert resolve_host("127.0.0.1", settings) == "127.0.0.1"
+
+
+class TestReplaySpeedResolution:
+    """How fast the replay runs, and who gets to decide.
+
+    Three layers with a deliberate ordering, for the same reason the port has
+    one: the public demo needs a default that suits a visitor giving it ninety
+    seconds, a local run needs one that suits a developer waiting for a specific
+    frame, and an operator who states a number must outrank both.
+    """
+
+    def test_a_local_run_uses_the_local_default(self) -> None:
+        assert resolve_replay_speed(None, Settings()) == LOCAL_REPLAY_SPEED
+
+    def test_a_public_demo_uses_the_public_default(self) -> None:
+        settings = Settings()
+        settings.service.public_demo = True
+        assert resolve_replay_speed(None, settings) == PUBLIC_DEMO_REPLAY_SPEED
+
+    def test_the_public_default_is_slower_than_the_local_one(self) -> None:
+        # Not an arbitrary pair. Above about 4x the motion stops reading as
+        # football at all, which matters on the surface a visitor judges and
+        # does not matter to a developer scrubbing for a frame.
+        assert PUBLIC_DEMO_REPLAY_SPEED < LOCAL_REPLAY_SPEED
+
+    def test_an_explicit_option_beats_the_public_default(self) -> None:
+        settings = Settings()
+        settings.service.public_demo = True
+        assert resolve_replay_speed(2.0, settings) == 2.0
+
+    def test_configuration_beats_the_mode_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FI_REPLAY__SPEED", "3.0")
+        settings = Settings()
+        settings.service.public_demo = True
+        assert resolve_replay_speed(None, settings) == 3.0
+
+    def test_configuring_the_field_default_is_still_an_instruction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The boundary a comparison against the default would get wrong.
+
+        `replay.speed` defaults to 1.0, so asking "does it differ from the
+        default?" reads an operator who explicitly asked for real time as
+        having said nothing, and hands them 4x. The question has to be whether
+        the key was set, which pydantic records.
+        """
+        monkeypatch.setenv("FI_REPLAY__SPEED", "1.0")
+        settings = Settings()
+        settings.service.public_demo = True
+        assert resolve_replay_speed(None, settings) == 1.0
+
+    def test_zero_is_accepted_as_as_fast_as_possible(self) -> None:
+        assert resolve_replay_speed(0.0, Settings()) == 0.0
+
+    def test_a_negative_speed_is_refused(self) -> None:
+        with pytest.raises(ConfigurationError, match="negative"):
+            resolve_replay_speed(-1.0, Settings())
+
+    def test_a_public_app_is_built_at_the_public_speed(self, tmp_path: Path) -> None:
+        """The default has to survive the wiring, not just the helper."""
+        app = create_configured_app(_public_settings(tmp_path))
+        player = app.state.fi.player
+        assert player is not None
+        assert player.speed == PUBLIC_DEMO_REPLAY_SPEED
 
 
 class TestPublicDemoSettings:
