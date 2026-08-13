@@ -32,7 +32,7 @@ from typing import TYPE_CHECKING, Final, Protocol
 import numpy as np
 
 from football_insights.data.acquire import AVAILABLE_MATCHES, MATCHES_BY_ID, MatchFiles
-from football_insights.data.synthetic import DEFAULT_PROFILE, PROFILES, FixtureProfile
+from football_insights.data.profiles import DEFAULT_PROFILE, PROFILES, FixtureProfile
 from football_insights.errors import DataValidationError, SchemaVersionError
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
 from football_insights.models.heuristic import HeuristicPredictor

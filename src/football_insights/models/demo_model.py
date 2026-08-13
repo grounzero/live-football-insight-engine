@@ -98,7 +98,8 @@ def _prepared_fixtures(settings: Settings, seed: int) -> tuple[list[MatchData], 
         of each per tactical archetype.
     """
     from football_insights.data.pipeline import prepare_parsed_match
-    from football_insights.data.synthetic import PROFILES, generate_synthetic_match
+    from football_insights.data.profiles import PROFILES
+    from football_insights.data.synthetic import generate_synthetic_match
     from football_insights.features.window import WindowGeometry
     from football_insights.models.train import MatchData
 
@@ -162,7 +163,7 @@ def build_demo_model(settings: Settings, out_dir: Path, *, seed: int = DEMO_SEED
         DataValidationError: If the fixtures yield too few positives to train on,
             or the exported graph disagrees with the model it came from.
     """
-    from football_insights.data.synthetic import PROFILES
+    from football_insights.data.profiles import PROFILES
     from football_insights.models.evaluate import choose_threshold_by_alarm_budget
     from football_insights.models.export_onnx import check_parity, export
     from football_insights.models.temporal import train_temporal

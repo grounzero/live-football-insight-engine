@@ -31,7 +31,8 @@ from football_insights.config import (
     resolve_port,
     resolve_replay_speed,
 )
-from football_insights.data.synthetic import PROFILES, generate_synthetic_match
+from football_insights.data.profiles import PROFILES
+from football_insights.data.synthetic import generate_synthetic_match
 from football_insights.errors import ConfigurationError, DataValidationError
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
 from football_insights.models.demo_model import DEMO_FIXTURES_PER_PROFILE, training_seed
