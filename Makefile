@@ -5,6 +5,7 @@ FI := .venv/bin/football-insights
 TEST_MATCH ?= Sample_Game_2
 
 .PHONY: help setup data prepare train evaluate export benchmark drift serve demo demo-build \
+        public-demo demo-public \
         demo-model test test-fast slice0 lint typecheck pyright format format-check audit check \
         codehealth clean reference container container-build container-smoke
 
@@ -50,6 +51,25 @@ demo-build: ## Build the React demo into the package's static directory
 	cd demo && npm ci --silent && npm run build
 
 demo: demo-build serve ## Build the demo, then serve it
+
+public-demo: demo-build demo-model ## Serve the public demo: three generated fixtures, rotating at 4x
+	# What the hosted deployment runs, on this machine. Three archetypes from
+	# the event-driven simulation, rotating at clean boundaries.
+	#
+	# `demo-model` is a dependency rather than a note in the README because
+	# skipping it produces a demo that runs perfectly and says nothing: the
+	# registry's `gru-temporal` is trained on Metrica and outranks everything
+	# in `PREFERRED`, so it gets loaded, scored against generated frames it
+	# has never seen the like of, and never clears its threshold. A silent
+	# pitch with no error anywhere is a bad way to find that out.
+	FI_REPLAY__LOOP=1 FI_MODEL__MODEL_NAME=demo-synthetic-gru \
+		$(FI) serve --public-demo
+
+# Named after the `--public-demo` flag and the `public_demo` setting rather
+# than filed under the `demo-*` prefix, because that is what everything else
+# calls it. The alias exists because the prefix is the other obvious guess and
+# a wrong guess here is a hard stop rather than a hint.
+demo-public: public-demo
 
 demo-model: ## Train and export the synthetic-data model the public demo serves
 	$(FI) demo-model
