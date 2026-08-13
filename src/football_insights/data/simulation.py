@@ -100,6 +100,15 @@ TOUCH_RADIUS_M: Final = 2.0
 #: controlling it.
 _DEFLECT_RADIUS_M: Final = 3.2
 
+#: Chance per *second* of flight that an eligible defender gets a touch.
+#:
+#: A rate rather than a per-frame probability, and the distinction is the whole
+#: point. The same 0.05 tested once per frame is 1.25 deflections per second at
+#: 25 Hz, which gave a typical 1.5 s pass an 85% chance of being deflected and
+#: put the count at 522-666 per 90 against a reference in the tens. Multiplied
+#: by the timestep it means what it reads as: about 7% of passes.
+_DEFLECT_RATE_PER_S: Final = 0.01
+
 #: How close an opponent must be to take the ball off the side that has it.
 #:
 #: Tighter than the touch radius on purpose. With twenty-two players inside a
@@ -127,6 +136,42 @@ _RESTART_WALK_MS: Final = 4.0
 #: roughly the reference's two dozen shots per 90 minutes.
 _SHOOTING_RANGE_M: Final = 26.0
 
+#: Seconds a receiver keeps the ball at their feet before doing anything with it.
+#:
+#: Without it a pass and the pass after it happen on the same frame: the
+#: receiver arrives, `_resolve_touches` calls straight into `_attacker_action`,
+#: and nobody ever holds the ball. That put possession spells at a median of
+#: 1.8-2.7 s against a reference 4.10, and was a large part of ~4,200 events per
+#: 90 against a reference 1,700-2,000.
+_CONTROL_TIME_S: Final[tuple[float, float]] = (0.9, 2.4)
+
+# ------------------------------------------------------------------ the keeper
+#
+# A goalkeeper is not a fielder with a different top speed, so the shape
+# calculation cannot place one. These describe the one thing they actually do
+# off the ball: stand between the ball and the goal, at a depth that depends on
+# how close the danger is.
+
+#: How far off the line they stand with the ball at the far end.
+_GK_LINE_STANDOFF_M: Final = 1.5
+
+#: Ball distance at which they begin to come out. Beyond it they are on their
+#: line; inside it the standoff grows toward `_GK_DEPTH_M`.
+_GK_ENGAGE_M: Final = 40.0
+
+#: How far off the line they get at the closest approach.
+_GK_DEPTH_M: Final = 7.0
+
+#: Extra depth for a side playing a high line, scaled by the profile's
+#: `line_offset_m` and applied only while the ball is in the opposition half.
+#: This is what makes `high_press` sweep and `counter` stay home, out of a field
+#: those profiles already set rather than a new knob.
+_GK_SWEEP_M: Final = 10.0
+
+#: They cover the goalmouth, not the width of the pitch. Roughly the six-yard
+#: box plus a stride.
+_GK_LATERAL_LIMIT_M: Final = 9.0
+
 #: Off-ball movement, as two harmonics per axis so the path is not a sine.
 _OFF_BALL_HARMONICS: Final = 2
 _OFF_BALL_AMPLITUDE_M: Final[tuple[float, float]] = (1.2, 3.4)
@@ -135,7 +180,17 @@ _OFF_BALL_FREQ_HZ: Final[tuple[float, float]] = (0.05, 0.13)
 #: Time constant of each player's view of where play is, so team shape follows
 #: the run of play rather than the ball. Reference median player speed is
 #: 1.50 m/s; a shape that tracked a 15 m/s pass directly would move far faster.
-_ROLE_FOLLOW_TAU_S: Final[dict[str, float]] = {"gk": 2.6, "def": 1.1, "mid": 1.5, "fwd": 2.1}
+#:
+#: The keeper is the exception and reads the ball almost directly. Theirs was
+#: the slowest of any role at 2.6 s, which meant their target lagged play by
+#: two and a half seconds — one of three reasons they never moved.
+_ROLE_FOLLOW_TAU_S: Final[dict[str, float]] = {"gk": 0.9, "def": 1.1, "mid": 1.5, "fwd": 2.1}
+
+#: Floor on the smoothing, after the profile's press scaling and the per-player
+#: draw. At the old 0.2 a `high_press` defender reached ~0.36 s and the block
+#: tracked the ball almost rigidly, which is why that profile ran 17.2 km per 90
+#: per player. A pressing side reacts fast; it does not snap.
+_MIN_FOLLOW_TAU_S: Final = 1.0
 
 #: Seconds a player takes to close the distance to where they want to be.
 #:
@@ -145,6 +200,15 @@ _ROLE_FOLLOW_TAU_S: Final[dict[str, float]] = {"gk": 2.6, "def": 1.1, "mid": 1.5
 #: The reference median is 1.50 m/s.
 _ARRIVAL_TIME_S: Final = 1.15
 
+#: Urgency for a player far from the ball, and the distance at which it applies.
+#:
+#: One arrival time for everybody meant a player forty metres away adjusting to
+#: a shift in shape sprinted there, which is why outfield distance came out at
+#: 11.7-17.2 km per 90 against a real 10-11. Involvement should set urgency:
+#: near the ball you work, away from it you drift into position.
+_INVOLVED_RADIUS_M: Final = 25.0
+_IDLE_ARRIVAL_TIME_S: Final = 2.8
+
 #: A player within this of where they want to be simply stands there.
 #:
 #: Without it nobody is ever still: the steering always asks for some velocity,
@@ -152,6 +216,14 @@ _ARRIVAL_TIME_S: Final = 1.15
 #: essentially no frame had anyone below walking pace where the reference has
 #: 12%. Real players spend a lot of a match standing.
 _SETTLE_RADIUS_M: Final = 1.6
+
+#: The same, for a goalkeeper, who adjusts in short steps.
+#:
+#: A keeper shifting across their goal moves a metre at a time, and the outfield
+#: radius erased all of it: the keeper's target almost never left the circle, so
+#: they were stationary for 85-93% of frames and covered under half a kilometre
+#: per 90 against a real 4-5.
+_GK_SETTLE_RADIUS_M: Final = 0.6
 
 #: 4-4-2 as fractions of half-length and half-width, attacking +x. Index 0 is
 #: the goalkeeper.
@@ -206,6 +278,7 @@ class _PlayerMotion:
     max_decel: np.ndarray
     turn_base: np.ndarray
     follow_tau: np.ndarray
+    settle: np.ndarray
     off_ball_amp: np.ndarray
     off_ball_freq: np.ndarray
     off_ball_phase: np.ndarray
@@ -234,6 +307,8 @@ def _draw_motion(rng: random.Random, profile: FixtureProfile, *, pressing: bool)
     freq = np.empty((N_PLAYERS, 2, _OFF_BALL_HARMONICS))
     phase = np.empty((N_PLAYERS, 2, _OFF_BALL_HARMONICS))
 
+    settle = np.empty(N_PLAYERS)
+
     lo_a, hi_a = _OFF_BALL_AMPLITUDE_M
     lo_f, hi_f = _OFF_BALL_FREQ_HZ
     for i in range(N_PLAYERS):
@@ -242,7 +317,11 @@ def _draw_motion(rng: random.Random, profile: FixtureProfile, *, pressing: bool)
         accel[i] = _ROLE_ACCEL_MS2[role] * profile.accel_scale * rng.uniform(0.90, 1.10)
         turn[i] = _TURN_BASE_RAD_S * rng.uniform(0.85, 1.15)
         tau[i] = _ROLE_FOLLOW_TAU_S[role] * press * rng.uniform(0.55, 1.75)
-        scale = 0.25 if role == "gk" else 1.0
+        settle[i] = _GK_SETTLE_RADIUS_M if role == "gk" else _SETTLE_RADIUS_M
+        # The keeper's shuffle. Lower than an outfielder's roaming, but no
+        # longer a quarter of it: the angle line now supplies the real movement
+        # and this is the adjustment on top of it.
+        scale = 0.6 if role == "gk" else 1.0
         for axis in range(2):
             axis_scale = 0.65 if axis == 0 else 1.0
             for harmonic in range(_OFF_BALL_HARMONICS):
@@ -257,7 +336,8 @@ def _draw_motion(rng: random.Random, profile: FixtureProfile, *, pressing: bool)
         max_accel=accel,
         max_decel=accel * _DECEL_RATIO,
         turn_base=turn,
-        follow_tau=np.clip(tau, 0.2, 6.0),
+        follow_tau=np.clip(tau, _MIN_FOLLOW_TAU_S, 6.0),
+        settle=settle,
         off_ball_amp=amp,
         off_ball_freq=freq,
         off_ball_phase=phase,
@@ -265,20 +345,38 @@ def _draw_motion(rng: random.Random, profile: FixtureProfile, *, pressing: bool)
 
 
 def steer(
-    pos: np.ndarray, vel: np.ndarray, target: np.ndarray, motion: _PlayerMotion, dt: float
+    pos: np.ndarray,
+    vel: np.ndarray,
+    target: np.ndarray,
+    motion: _PlayerMotion,
+    dt: float,
+    arrival: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Advance one team a frame under acceleration and turning limits.
 
     Three limits in order: a desired velocity toward the target that eases off
     over the last stride, an acceleration cap with a larger one for slowing
     down, and a yaw-rate cap that tightens with speed.
+
+    Args:
+        pos: Current positions, one row per player.
+        vel: Current velocities, one row per player.
+        target: Where each player is trying to be this frame.
+        motion: The team's movement limits, including its settle radii.
+        dt: Timestep in seconds.
+        arrival: Seconds each player is willing to take to reach their target.
+            Per-player rather than the single `_ARRIVAL_TIME_S`, because urgency
+            depends on involvement — see `_Sim._arrival`.
+
+    Returns:
+        The new positions and velocities.
     """
     delta = target - pos
     dist = np.hypot(delta[:, 0], delta[:, 1])
     safe = np.maximum(dist, 1e-9)
 
-    wanted = np.minimum(motion.max_speed, dist / _ARRIVAL_TIME_S)
-    wanted = np.where(dist < _SETTLE_RADIUS_M, 0.0, wanted)
+    wanted = np.minimum(motion.max_speed, dist / arrival)
+    wanted = np.where(dist < motion.settle, 0.0, wanted)
     desired = delta / safe[:, None] * wanted[:, None]
 
     dv = desired - vel
@@ -398,6 +496,9 @@ class _Sim:
         #: get there first is what decides if the pass is completed, so this
         #: is an intention, never an outcome.
         self._intended: tuple[Team, int] | None = None
+        #: Frame until which whoever received the ball is settling it before
+        #: doing anything with it.
+        self._control_until = 0
         self._intended_at = np.zeros(2)
         self._pending: _Pending | None = None
         self._in_box_prev = False
@@ -430,14 +531,58 @@ class _Sim:
 
         if drift is not None:
             xy += drift
-
-        xy[0, 0] = -0.96 * self._pitch.half_length * sign
-        xy[0, 1] = 0.22 * ball_view[0, 1]
+            xy[0] = self._keeper_target(team, ball_view[0]) + drift[0]
+        else:
+            xy[0] = self._keeper_target(team, ball_view[0])
 
         half_l, half_w = self._pitch.half_length, self._pitch.half_width
         np.clip(xy[:, 0], -half_l + 1.0, half_l - 1.0, out=xy[:, 0])
         np.clip(xy[:, 1], -half_w + 1.0, half_w - 1.0, out=xy[:, 1])
         return xy
+
+    def _keeper_target(self, team: Team, ball_view: np.ndarray) -> np.ndarray:
+        """Where ``team``'s goalkeeper wants to be.
+
+        Its own method because a keeper is not a fielder with a different top
+        speed, and the formation calculation cannot place one. They stand on the
+        line between the ball and their own goal, at a depth that grows as the
+        ball comes closer — narrowing the angle — and they cover the goalmouth
+        rather than the width of the pitch.
+
+        The previous version pinned x to a constant and tracked 22% of a heavily
+        lagged ball position, which produced exactly zero metres of forward
+        travel across a whole period.
+        """
+        own_goal = self._goal_centre(team.opponent)
+        to_ball = ball_view - own_goal
+        distance = magnitude(to_ball)
+        if distance < 1e-6:
+            return np.asarray(own_goal + np.array([self._sign[team] * _GK_LINE_STANDOFF_M, 0.0]))
+        unit = to_ball / distance
+
+        closeness = min(max(1.0 - distance / _GK_ENGAGE_M, 0.0), 1.0)
+        depth = _GK_DEPTH_M * closeness
+
+        # A side with play in the other half leaves ground behind it, and the
+        # keeper is who covers it. How far they step up is the profile's:
+        # `high_press` pushes right out, `counter` stays on its line, and a
+        # patient side is somewhere between. Only while play is in the far half
+        # — a sweeper keeper defends space, they do not stand there once the
+        # ball comes back.
+        in_far_half = float(ball_view[0]) * self._sign[team] > 0.0
+        if in_far_half:
+            step_up = min(max(0.4 + self._profile.line_offset_m / 14.0, 0.0), 1.0)
+            depth += _GK_SWEEP_M * step_up
+
+        target = np.asarray(own_goal + unit * (_GK_LINE_STANDOFF_M + depth))
+        target[1] = float(np.clip(target[1], -_GK_LATERAL_LIMIT_M, _GK_LATERAL_LIMIT_M))
+        return target
+
+    def _in_own_area(self, team: Team, point: np.ndarray) -> bool:
+        """Whether ``point`` is inside the penalty area ``team`` defends."""
+        own_goal_x = self._pitch.half_length * -self._sign[team]
+        inside_x = abs(float(point[0]) - own_goal_x) <= self._pitch.penalty_area_depth
+        return inside_x and abs(float(point[1])) <= self._pitch.penalty_area_y_abs_max
 
     def _goal_centre(self, team: Team) -> np.ndarray:
         """The goal ``team`` is attacking."""
@@ -595,6 +740,10 @@ class _Sim:
 
     def _attacker_action(self, team: Team, player: int) -> None:
         """Decide what a player in possession does with the ball."""
+        if player == 0:
+            self._distribute(team, player)
+            return
+
         goal = self._goal_centre(team)
         to_goal = goal - self._ball
         range_to_goal = magnitude(to_goal)
@@ -661,6 +810,43 @@ class _Sim:
         velocity = self._launch(self._ball, self._ball + heading * push, 0.7)
         self._touch(team, player, velocity, EventType.CARRY, "CARRY", None)
 
+    def _distribute(self, team: Team, player: int) -> None:
+        """A goalkeeper with the ball puts it back into play.
+
+        Long and upfield like a clearance, because that is the shape of the
+        delivery, but recorded as its own thing: the event log should not call a
+        goal kick a panic hoof. Aimed at a team-mate when there is one to aim
+        at, so distribution can be intercepted like any other pass.
+        """
+        option = self._pass_target(team, player)
+        if option is not None:
+            mate, lead = option
+            self._touch(
+                team,
+                player,
+                self._launch(self._ball, lead, 1.4),
+                EventType.PASS,
+                "DISTRIBUTION",
+                "DISTRIBUTION",
+            )
+            self._intended = (team, mate)
+            self._intended_at = lead
+            return
+
+        sign = self._sign[team]
+        distance = self._rng.uniform(*_CLEARANCE_LENGTH_M)
+        aim = self._ball + np.array(
+            [sign * distance, self._rng.uniform(-1.0, 1.0) * distance * 0.35]
+        )
+        self._touch(
+            team,
+            player,
+            self._launch(self._ball, aim, 1.6),
+            EventType.PASS,
+            "DISTRIBUTION",
+            "DISTRIBUTION",
+        )
+
     def _clear(self, team: Team, player: int) -> None:
         """Hoof it. Long, roughly upfield, and deliberately not to anybody."""
         sign = self._sign[team]
@@ -706,7 +892,7 @@ class _Sim:
             self._record(team, EventType.RECOVERY, "RECOVERY", "INTERCEPTION")
             self._carry(team, player)
             return
-        if roll < 0.58:
+        if roll < 0.44:
             # Redirected without control: a new direction, a recorded cause,
             # and the ball loose for whoever gets there next.
             speed = magnitude(self._ball_vel) * self._rng.uniform(0.3, 0.7)
@@ -770,6 +956,7 @@ class _Sim:
         self._restart_team = restart_for
         self._dead_until = self._frame + int(self._rng.uniform(*_RESTART_PAUSE_S) * self._rate)
         self._holder = None
+        self._control_until = 0
         return True
 
     def _walk_to_restart(self) -> None:
@@ -798,6 +985,7 @@ class _Sim:
         # and recorded the resulting touch six metres from the ball.
         self._holder = None
         self._intended = None
+        self._control_until = 0
         self._restart_grace = self._frame + int(self._restart_grace_s * self._rate)
 
     # ------------------------------------------------------------ the loop
@@ -813,6 +1001,14 @@ class _Sim:
         # closing it down out of possession. Everyone else holds shape.
         distances = self._distances(team)
         chaser = int(np.argmin(distances[1:]) + 1)
+        # The keeper competes for it only inside their own area, and only when
+        # it is not already someone's. That is the difference between coming for
+        # a cross and running to the halfway line: gate on the area, not on who
+        # happens to be nearest, or the keeper leaves their goal every time play
+        # is in their half.
+        loose = self._holder is None or self._holder[0] is not team
+        if loose and self._in_own_area(team, self._ball) and distances[0] < distances[chaser]:
+            chaser = 0
         lead = self._ball + self._ball_vel * 0.35
         shape[chaser] = lead
         if self._phase is Phase.DEAD and team is not self._restart_team:
@@ -821,6 +1017,19 @@ class _Sim:
         if self._intended is not None and self._intended[0] is team:
             shape[self._intended[1]] = self._intended_at
         return shape
+
+    def _arrival(self, team: Team) -> np.ndarray:
+        """How urgently each player of ``team`` closes on their target.
+
+        Involvement sets urgency. Near the ball a player is in the game and
+        moves at the base arrival time; far from it they are adjusting their
+        position and amble there. A single arrival time for everyone had players
+        forty metres from the ball sprinting to keep shape, which is most of why
+        outfield distance came out half again as high as a real match.
+        """
+        distances = self._distances(team)
+        far = np.clip(distances / _INVOLVED_RADIUS_M, 0.0, 1.0)
+        return _ARRIVAL_TIME_S + far * (_IDLE_ARRIVAL_TIME_S - _ARRIVAL_TIME_S)
 
     def step(self, index: int, now: float) -> None:
         """Advance one frame."""
@@ -845,7 +1054,12 @@ class _Sim:
         for team in (Team.HOME, Team.AWAY):
             targets = self._targets(team, attacking_team is team, now)
             self._pos[team], self._vel[team] = steer(
-                self._pos[team], self._vel[team], targets, self._motion[team], self._dt
+                self._pos[team],
+                self._vel[team],
+                targets,
+                self._motion[team],
+                self._dt,
+                self._arrival(team),
             )
 
         self._track_entry(now)
@@ -877,9 +1091,36 @@ class _Sim:
         if same_foot and magnitude(self._ball_vel) > 1.2:
             return
         if self._holder is None or self._holder[0] is team:
+            # Settling the ball takes a moment, and until it is settled the
+            # player does nothing with it. An opponent can still come and take
+            # it — that is the branch below, and it is why this guard sits here
+            # rather than at the top of the method.
+            if self._frame < self._control_until:
+                return
+            if not same_foot and self._holder is not None and magnitude(self._ball_vel) > 1.2:
+                self._receive(team, player)
+                return
             self._attacker_action(team, player)
         else:
             self._defender_action(team, player)
+
+    def _receive(self, team: Team, player: int) -> None:
+        """Take a pass down.
+
+        The ball comes under control and travels with the receiver, which is
+        both what a first touch does and what keeps `_touch` the only writer of
+        ball velocity. Recorded as a carry because that is what it becomes: the
+        ball is at this player's feet and moving with them.
+        """
+        self._touch(
+            team,
+            player,
+            self._vel[team][player].copy(),
+            EventType.CARRY,
+            "RECEPTION",
+            "RECEPTION",
+        )
+        self._control_until = self._frame + int(self._rng.uniform(*_CONTROL_TIME_S) * self._rate)
 
     def _maybe_deflect(self) -> None:
         """A defender near the ball's line may get a touch on it in passing."""
@@ -890,10 +1131,9 @@ class _Sim:
         nearest = int(np.argmin(distances))
         if distances[nearest] > _DEFLECT_RADIUS_M:
             return
-        # Rare on purpose. At a quarter it was the most frequent event in the
-        # match and possession changed hands roughly once a second; a ball
-        # passing near a defender usually passes near a defender.
-        if self._rng.random() > 0.05:
+        # Rare on purpose, and a rate rather than a per-frame draw. A ball
+        # passing near a defender usually just passes near a defender.
+        if self._rng.random() > _DEFLECT_RATE_PER_S * self._dt:
             return
         speed = magnitude(self._ball_vel) * self._rng.uniform(0.4, 0.8)
         angle = math.atan2(self._ball_vel[1], self._ball_vel[0]) + self._rng.uniform(-1.2, 1.2)
