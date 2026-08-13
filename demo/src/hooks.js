@@ -185,6 +185,7 @@ function useReadiness() {
         dataSource: body.data_source ?? null,
         predictor: body.predictor ?? null,
         replay: body.replay ?? null,
+        build: body.build ?? null,
       })
     }
     poll()

@@ -141,6 +141,12 @@ export function runtimeSummary(runtime) {
     predictorName: predictor?.name ?? null,
     predictorIsMl: predictor ? Boolean(predictor.is_ml) : null,
     replay: runtime.replay ?? 'unknown',
+    // A build with no commit is a source-tree run, not a mystery: say the
+    // version and stop, rather than printing a placeholder that reads like a
+    // deployment whose identity was lost.
+    build: runtime.build
+      ? [runtime.build.version, runtime.build.commit].filter(Boolean).join(' · ')
+      : null,
   }
 }
 

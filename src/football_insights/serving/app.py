@@ -57,6 +57,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 from sse_starlette.sse import EventSourceResponse
 
+from football_insights.build import build_info
 from football_insights.config import Settings
 from football_insights.features.spec import DEFAULT_FEATURE_SPEC
 from football_insights.serving.loader import available_matches
@@ -549,6 +550,7 @@ async def ready(response: Response, st: StateDep) -> JsonDict:
             "is_ml": predictor.metadata.is_ml,
         },
         "ui": st.ui_available,
+        "build": build_info(),
         "replay": _replay_state(st),
     }
 

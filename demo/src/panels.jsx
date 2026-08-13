@@ -50,6 +50,12 @@ export function RuntimeStatus({ runtime }) {
         <dt>Replay</dt>
         <dd>{summary.replay}</dd>
       </div>
+      {summary.build ? (
+        <div>
+          <dt>Build</dt>
+          <dd>{summary.build}</dd>
+        </div>
+      ) : null}
     </dl>
   )
 }

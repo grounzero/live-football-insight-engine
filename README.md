@@ -15,10 +15,15 @@ worth showing, and knowing when not to.
 > short horizon, never statements of fact. This is not an injury, betting, officiating or
 > player-safety system.
 
-**Live demo:** _(not yet deployed — see [Public demo deployment](#public-demo-deployment); add the
-generated URL here and in the GitHub **About** panel once it is up)_. The hosted demo replays a
-**generated synthetic fixture**, not real match data, and scores it with a model trained on that
-fixture. The results below were measured on Metrica matches and describe a different artifact.
+**Live demo:** <https://live-football-insight-engine-production.up.railway.app>
+
+It replays **generated synthetic fixtures** — three tactical archetypes rotating at 4× match pace —
+not real match data, and scores them with a model trained on that same generator. The
+[Results](#results) below were measured on Metrica matches and describe a *different* artifact. The
+page says so itself, in the footer and in `GET /ready`, so it cannot drift from what is actually
+running.
+
+Playback is read-only: one replay is shared by every viewer, so a pause would be everyone's pause.
 
 ---
 
