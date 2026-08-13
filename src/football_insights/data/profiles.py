@@ -86,10 +86,10 @@ PROFILES: Final[tuple[FixtureProfile, ...]] = (
         directness=0.55,
         width_scale=0.82,
         line_offset_m=7.0,
-        press_squeeze=0.56,
+        press_squeeze=0.42,
         press_reaction_scale=0.60,
-        player_speed_scale=1.02,
-        accel_scale=1.12,
+        player_speed_scale=0.98,
+        accel_scale=1.05,
     ),
     FixtureProfile(
         key="counter",

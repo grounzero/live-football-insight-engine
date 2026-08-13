@@ -26,6 +26,7 @@ from football_insights.data.simulation import (
 )
 from football_insights.data.synthetic import SyntheticMatch, generate_synthetic_match
 from football_insights.domain import EventType
+from football_insights.pitch import DEFAULT_PITCH
 
 FRAME_RATE = 25.0
 DURATION_S = 240.0
@@ -298,6 +299,110 @@ class TestEventVocabulary:
         assert frames == sorted(frames)
         for event in match.events:
             assert event.end_frame >= event.start_frame
+
+
+class TestGoalkeeper:
+    """A goalkeeper is a player, not a piece of scenery.
+
+    Written after the hosted demo shipped with keepers whose forward target was
+    a constant: measured across a whole period they covered exactly 0.00 m of
+    ground in x, and stood below walking pace for 85-93% of frames. Every
+    assertion here is a bound the old behaviour fails.
+    """
+
+    def _keeper_tracks(self, match: SyntheticMatch) -> list[np.ndarray]:
+        """Both keepers' position tracks. Column 0 is the goalkeeper."""
+        return [match.tracking.home_xy[:, 0], match.tracking.away_xy[:, 0]]
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=lambda p: p.key)
+    def test_the_keeper_moves(self, profile: object) -> None:
+        """They cover ground, and they do it in both axes.
+
+        The x span is the one that matters: it was identically zero, and no
+        distance or speed bound catches that on its own — a keeper shuffling
+        along their line covers distance without ever leaving it.
+        """
+        match = generate_synthetic_match(
+            seed=11,
+            n_periods=1,
+            period_duration_s=DURATION_S,
+            frame_rate=FRAME_RATE,
+            profile=profile,  # type: ignore[arg-type]
+        )
+        for keeper in self._keeper_tracks(match):
+            x_span = float(keeper[:, 0].max() - keeper[:, 0].min())
+            distance = float(np.hypot(*np.diff(keeper, axis=0).T).sum())
+            per_90 = distance * (90.0 * 60.0 / DURATION_S) / 1000.0
+
+            assert x_span > 3.0, f"keeper moved {x_span:.2f} m along the pitch"
+            assert per_90 > 1.5, f"keeper covered {per_90:.2f} km per 90"
+
+    @pytest.mark.parametrize("profile", PROFILES, ids=lambda p: p.key)
+    def test_the_keeper_stays_home(self, profile: object) -> None:
+        """Coming for the ball is not the same as joining the attack.
+
+        The counterpart to the test above: whatever makes them move must not
+        let them wander. A keeper who solves "does not move" by running around
+        the pitch has replaced one wrong behaviour with a worse one.
+        """
+        match = generate_synthetic_match(
+            seed=11,
+            n_periods=1,
+            period_duration_s=DURATION_S,
+            frame_rate=FRAME_RATE,
+            profile=profile,  # type: ignore[arg-type]
+        )
+        # Widest they have any business being: the corner of their own penalty
+        # area, which is as far as chasing a loose ball inside it can take them.
+        lateral_limit = DEFAULT_PITCH.penalty_area_y_abs_max + TOUCH_RADIUS_M * 3.0
+        for keeper, sign in zip(self._keeper_tracks(match), (1.0, -1.0), strict=True):
+            # Oriented so their own goal is at -half_length regardless of side.
+            own_half_x = keeper[:, 0] * sign
+            assert own_half_x.max() < 0.0, (
+                f"keeper reached x={own_half_x.max():.1f} m past their own half"
+            )
+            assert abs(keeper[:, 1]).max() < lateral_limit, (
+                f"keeper reached {abs(keeper[:, 1]).max():.1f} m from the centre line"
+            )
+
+
+class TestReception:
+    """Taking the ball down is a touch like any other."""
+
+    def test_a_reception_is_recorded_and_holds_the_ball(self, match: SyntheticMatch) -> None:
+        """Receptions exist, and they belong to the side that was passing.
+
+        Without them a pass and the pass after it landed on the same frame,
+        nobody ever held the ball, and possession spells ran at a median of
+        1.8 s against a reference 4.10.
+        """
+        receptions = [e for e in match.events if e.subtype == "RECEPTION"]
+        assert receptions, "no receptions recorded"
+
+        by_frame = sorted(match.events, key=lambda e: (e.start_frame, e.type.value))
+        order = {id(e): i for i, e in enumerate(by_frame)}
+        for reception in receptions:
+            index = order[id(reception)]
+            assert index > 0, "a reception cannot be the first event of a period"
+            previous = by_frame[index - 1]
+            assert previous.team is reception.team, (
+                f"reception after {previous.raw_type} by the other side"
+            )
+
+    def test_a_reception_does_not_speed_the_ball_up(self, match: SyntheticMatch) -> None:
+        """A first touch settles the ball; it does not strike it."""
+        index = {int(frame): i for i, frame in enumerate(match.tracking.frame)}
+        _, speed, _ = _ball_kinematics(match)
+        for event in match.events:
+            if event.subtype != "RECEPTION":
+                continue
+            row = index.get(event.start_frame)
+            if row is None or row + EVENT_WINDOW >= len(speed):
+                continue
+            after = speed[row + EVENT_WINDOW]
+            assert after <= MAX_PLAYER_SPEED_MS, (
+                f"ball left a reception at {after:.1f} m/s, faster than any player"
+            )
 
 
 class TestDeterminism:
