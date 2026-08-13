@@ -23,6 +23,7 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from football_insights.build import build_info
 from football_insights.config import (
     LOCAL_REPLAY_SPEED,
     PUBLIC_DEMO_REPLAY_SPEED,
@@ -1003,3 +1004,48 @@ class TestStreamEndSignal:
         message = stream_message(StreamMessageType.END, {"frames": 12})
 
         assert message.data == json.dumps({"type": "end", "payload": {"frames": 12}})
+
+
+class TestBuildIdentity:
+    """A deployment must be able to say which build it is.
+
+    Without this the only way to tell a deployed commit from the one before it
+    is to compare wording on the page against the source — which is how a slow
+    deploy came to be read as a failed one.
+    """
+
+    def test_a_source_tree_run_reports_a_version_and_no_commit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name in ("FI_BUILD_COMMIT", "RAILWAY_GIT_COMMIT_SHA"):
+            monkeypatch.delenv(name, raising=False)
+        info = build_info()
+
+        assert info["version"]
+        # Absent rather than empty: "not built from a known commit" is a
+        # different statement from "built from a commit called nothing".
+        assert "commit" not in info
+
+    def test_the_build_argument_is_reported(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("FI_BUILD_COMMIT", "1b1ad2938fa4c1")
+        assert build_info()["commit"] == "1b1ad29"
+
+    def test_the_platform_variable_is_a_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("FI_BUILD_COMMIT", raising=False)
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "28a12d3ffffffff")
+        assert build_info()["commit"] == "28a12d3"
+
+    def test_the_build_argument_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The image records what it was built from; the platform records what it
+        # thinks it deployed. When they disagree the image is the authority.
+        monkeypatch.setenv("FI_BUILD_COMMIT", "aaaaaaa1111")
+        monkeypatch.setenv("RAILWAY_GIT_COMMIT_SHA", "bbbbbbb2222")
+        assert build_info()["commit"] == "aaaaaaa"
+
+    def test_readiness_carries_the_build(self, tmp_path: Path, built_demo: None) -> None:
+        _ = built_demo
+        app = create_configured_app(_public_settings(tmp_path), speed=0.0)
+        body = ApiClient(TestClient(app)).get("/ready").json()
+
+        assert "build" in body
+        assert body["build"]["version"]

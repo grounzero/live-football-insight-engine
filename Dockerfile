@@ -15,6 +15,13 @@
 ARG PYTHON_IMAGE=python:3.13-slim
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cpu
 
+# Which commit this image was built from. A running container has no git and no
+# repository to ask, so if the build does not record it the deployment cannot
+# say what it is — and a slow deploy then looks exactly like a failed one.
+# Optional: an image built without it reports its version and no commit, which
+# is honest rather than misleading.
+ARG FI_BUILD_COMMIT=""
+
 # ---------------------------------------------------------------- frontend
 FROM node:22-slim AS frontend
 
@@ -90,6 +97,9 @@ COPY --from=builder /opt/venv /opt/venv
 # sibling .onnx.data file that ONNX Runtime resolves by name at load time.
 COPY --from=demomodel /artifacts/registry /opt/artifacts/registry
 COPY configs ./configs
+
+ARG FI_BUILD_COMMIT
+ENV FI_BUILD_COMMIT="${FI_BUILD_COMMIT}"
 
 ENV PATH="/opt/venv/bin:${PATH}" \
     PYTHONUNBUFFERED=1 \
